@@ -1,0 +1,80 @@
+/* Glass is applied to the backdrop only; the approved type scale is unchanged. */
+:root {
+  --glass-fill: #ffffff9c;
+  --glass-line: #ffffffd9;
+  --glass-edge: #ffffffed;
+  --glass-shadow: #20385916;
+  --glass-primary: #ffffffb8;
+  --glass-primary-ink: #142337;
+}
+[data-theme="dark"] {
+  --glass-fill: #14233770;
+  --glass-line: #ffffff26;
+  --glass-edge: #ffffff70;
+  --glass-shadow: #00000038;
+  --glass-primary: #ffffffb8;
+  --glass-primary-ink: #0a0a0a;
+}
+.ambient-effects { position: absolute; inset: 0 0 auto; height: min(1200px, max(100svh, 760px)); overflow: hidden; z-index: 0; pointer-events: none; mask-image: linear-gradient(#000 0%, #000d 65%, transparent 100%); }
+.ambient-effects canvas { display: block; width: 100%; height: 100%; }
+.ambient-effects::before { content: ""; position: absolute; width: 68%; height: 72%; top: 12%; right: -8%; border-radius: 50%; background: radial-gradient(ellipse, #6994ca12, transparent 68%); animation: ambient-drift 24s ease-in-out infinite alternate; }
+.ambient-effects.is-paused::before { animation-play-state: paused; }
+.effects-definitions { position: absolute; width: 0; height: 0; overflow: hidden; pointer-events: none; }
+.app-frame { position: relative; z-index: 1; }
+.app-header { position: fixed; }
+.app-header::before { content: ""; position: absolute; inset: -2px -16px; z-index: -1; pointer-events: none; border: 1px solid var(--glass-line); border-radius: 99px; background: linear-gradient(140deg, #ffffff15, #ffffff00 58%), var(--glass-fill); box-shadow: inset 0 1px 0 var(--glass-edge), 0 8px 32px var(--glass-shadow); -webkit-backdrop-filter: blur(22px) saturate(1.5); backdrop-filter: blur(22px) saturate(1.5); opacity: 0; transition: opacity .24s ease; }
+.app-header.is-scrolled::before { opacity: 1; }
+
+.hero-actions .btn-primary, .modal-foot .btn-primary {
+  position: relative;
+  isolation: isolate;
+  background: linear-gradient(155deg, #ffffff8c, #ffffff14 55%, #ffffff45), var(--glass-primary);
+  color: var(--glass-primary-ink);
+  border-color: var(--glass-edge);
+  box-shadow: inset 0 1px 0 #ffffffde, inset 0 -1px 0 #ffffff80, 0 6px 20px var(--glass-shadow);
+  -webkit-backdrop-filter: blur(9px) saturate(1.35);
+  backdrop-filter: blur(9px) saturate(1.35);
+}
+.hero-actions .btn-primary:hover, .modal-foot .btn-primary:hover { background: linear-gradient(155deg, #ffffffad, #ffffff30 55%, #ffffff65), var(--glass-primary); }
+.hero-actions .btn-primary.has-glass-refraction, .modal-foot .btn-primary.has-glass-refraction { backdrop-filter: var(--glass-refraction) blur(5px) saturate(1.35); }
+.hero-actions .btn-primary::after, .modal-foot .btn-primary::after { content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; background: radial-gradient(ellipse at var(--glass-x, 35%) var(--glass-y, 0%), #ffffffc9, #ffffff00 68%); opacity: .25; transition: opacity .24s; }
+.hero-actions .btn-primary.is-glass-hovered::after, .modal-foot .btn-primary.is-glass-hovered::after { opacity: .7; }
+.hero-actions .btn-ghost { border-color: var(--glass-line); background: linear-gradient(140deg, #ffffff09, #ffffff00); box-shadow: inset 0 1px 0 #ffffff0d; -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.hero-actions .btn-ghost:hover { border-color: var(--glass-edge); background: #ffffff0d; }
+.folders-panel { background: var(--glass-fill); border-color: var(--glass-line); box-shadow: inset 0 1px 0 #ffffff26, 0 20px 60px var(--glass-shadow); -webkit-backdrop-filter: blur(24px) saturate(1.2); backdrop-filter: blur(24px) saturate(1.2); }
+.folders-panel .panel-head { background: radial-gradient(ellipse at var(--glass-x, 30%) 0%, #ffffff0d, transparent 70%); }
+.panel, .table-shell, .identity-card, .pairing-card, .peer-card, .settings-card, .info-card, .conflict-panel {
+  background: radial-gradient(ellipse at var(--glass-x, 25%) var(--glass-y, 0%), #ffffff0b, transparent 64%), linear-gradient(145deg, #ffffff08, #ffffff00 55%), var(--glass-fill);
+  border-color: var(--glass-line);
+  box-shadow: inset 0 1px 0 #ffffff26, inset 0 -1px 0 #ffffff08, 0 14px 46px var(--glass-shadow);
+  -webkit-backdrop-filter: blur(24px) saturate(1.25);
+  backdrop-filter: blur(24px) saturate(1.25);
+}
+.address-line, .pair-code i, .search-box, .segmented { background: #ffffff09; }
+[data-theme="light"] .address-line, [data-theme="light"] .pair-code i, [data-theme="light"] .search-box, [data-theme="light"] .segmented { background: #ffffff70; }
+.row-menu-popover, .modal { background: linear-gradient(145deg, #ffffff09, transparent 55%), var(--glass-fill); border-color: var(--glass-line); box-shadow: inset 0 1px 0 #ffffff38, 0 18px 60px var(--glass-shadow); -webkit-backdrop-filter: blur(28px) saturate(1.25); backdrop-filter: blur(28px) saturate(1.25); }
+.row-menu-popover.has-glass-refraction { backdrop-filter: var(--glass-refraction) blur(18px) saturate(1.25); }
+@supports (appearance: base-select) {
+  select::picker(select) {
+    background: linear-gradient(145deg, #ffffff0d, transparent 60%), var(--glass-fill);
+    border-color: var(--glass-line);
+    box-shadow: inset 0 1px 0 var(--glass-edge), 0 12px 36px var(--glass-shadow);
+    -webkit-backdrop-filter: blur(24px) saturate(1.25);
+    backdrop-filter: blur(24px) saturate(1.25);
+  }
+}
+.modal-overlay { background: #050b1366; }
+.mobile-nav { background: var(--glass-fill); border-color: var(--glass-line); -webkit-backdrop-filter: blur(24px) saturate(1.4); backdrop-filter: blur(24px) saturate(1.4); box-shadow: inset 0 1px 0 #ffffff1f; }
+
+@supports not (backdrop-filter: blur(1px)) {
+  .panel, .table-shell, .identity-card, .pairing-card, .peer-card, .settings-card, .info-card, .conflict-panel, .modal, .row-menu-popover, .mobile-nav, .app-header::before { background: var(--surface); }
+}
+@media (max-width: 760px) {
+  .app-header::before { inset: -2px -12px; }
+  .folders-panel { -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ambient-effects::before { animation: none; }
+  .hero-actions .btn-primary.has-glass-refraction, .modal-foot .btn-primary.has-glass-refraction { backdrop-filter: blur(9px) saturate(1.35); }
+}
+@keyframes ambient-drift { from { transform: translate3d(-3%, -2%, 0) scale(.96); } to { transform: translate3d(4%, 3%, 0) scale(1.04); } }
