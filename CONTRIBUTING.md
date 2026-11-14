@@ -22,6 +22,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
 ## 提交修改
 
 - 每个 Pull Request 聚焦一个问题，说明改动原因、行为变化与验证结果。
+- 提交信息、Pull Request 标题和说明使用中文。
 - 同步、删除、覆盖、权限和版本恢复的改动应包含相应的回归验证。
 - 不提交 `data/`、`local-data/`、`dist/`、临时测试目录或本机身份数据。
 - 使用现有代码和界面风格；引入依赖时说明必要性，并保留第三方许可。

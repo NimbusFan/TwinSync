@@ -157,6 +157,7 @@ namespace TwinSync.Native
                 a = new CoreService(args[1], Path.Combine(root, "home-a"), FreePort(), path => { lock (revealCalls) revealCalls.Add(path); });
                 b = new CoreService(args[1], Path.Combine(root, "home-b"), FreePort());
                 a.Config.Device["port"] = a.Port; b.Config.Device["port"] = b.Port;
+                a.Config.Settings["discoveryEnabled"] = false; b.Config.Settings["discoveryEnabled"] = false;
                 Check(a.Config.Folders.Count == 0 && b.Config.Folders.Count == 0, "Fresh installs must have no sync folders");
                 Check(JsonUtil.GetString(a.Config.Device["name"], "") == "", "Device name must be chosen by the user");
                 a.Start(); b.Start();

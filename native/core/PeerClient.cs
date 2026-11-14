@@ -1,11 +1,17 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
 using Newtonsoft.Json.Linq;
 namespace TwinSync.Native
 {
+    internal sealed class PeerRequestException : IOException
+    {
+        internal readonly int Status;
+        internal PeerRequestException(string text, int status, Exception inner = null) : base(text, inner) { Status = status; }
+    }
     internal sealed class PeerClient
     {
         private readonly JObject peer;
@@ -58,11 +64,24 @@ namespace TwinSync.Native
                     {
                         var text = input.ReadToEnd();
                         try { text = JsonUtil.GetString(JObject.Parse(text)["error"], text); } catch { }
-                        throw new Exception(text.Length > 300 ? text.Substring(0, 300) : text);
+                        throw new PeerRequestException(text.Length > 300 ? text.Substring(0, 300) : text, (int)response.StatusCode);
                     }
                 }
-                throw new Exception("无法建立经过设备指纹验证的加密连接，请检查地址、指纹和对方服务状态", error);
+                throw;
             }
+        }
+        private static bool Transient(Exception error)
+        {
+            var peerError = error as PeerRequestException;
+            if (peerError != null) return peerError.Status == 408 || peerError.Status == 429 || peerError.Status == 502 || peerError.Status == 503 || peerError.Status == 504;
+            var web = error as WebException;
+            if (web != null) return new[] { WebExceptionStatus.ConnectFailure, WebExceptionStatus.ConnectionClosed, WebExceptionStatus.Timeout, WebExceptionStatus.ReceiveFailure, WebExceptionStatus.SendFailure, WebExceptionStatus.NameResolutionFailure, WebExceptionStatus.KeepAliveFailure }.Contains(web.Status);
+            return error is EndOfStreamException || error is IOException && error.InnerException is System.Net.Sockets.SocketException;
+        }
+        private void Backoff(int attempt, Exception error)
+        {
+            if (attempt >= 3 || !Transient(error)) throw error;
+            for (var i = 0; i < (10 << attempt); i++) { if (check != null) check(); System.Threading.Thread.Sleep(100); }
         }
         private static void WriteJson(HttpWebRequest request, JToken body)
         {
@@ -116,21 +135,93 @@ namespace TwinSync.Native
 
         public JObject Download(string folderId, JObject entry, string destination, Action<long, long> progress = null)
         {
-            var route = "/peer/file?folder=" + Uri.EscapeDataString(folderId) + "&path=" + Uri.EscapeDataString(EntryUtil.PathOf(entry));
+            var route = "/peer/file?folder=" + Uri.EscapeDataString(folderId) + "&path=" + Uri.EscapeDataString(EntryUtil.PathOf(entry)) + "&hash=" + Uri.EscapeDataString(EntryUtil.HashOf(entry));
             Directory.CreateDirectory(Path.GetDirectoryName(destination));
-            var temp = destination + ".twinsync-part-" + Guid.NewGuid().ToString("N");
-            try
+            var temp = destination + ".twinsync-part-" + ResumableTransfers.Digest(peer["id"] + "|" + folderId + "|" + EntryUtil.PathOf(entry) + "|" + EntryUtil.HashOf(entry) + "|" + peer["token"]);
+            SafeFiles.Join(Path.GetDirectoryName(destination), Path.GetFileName(temp));
+            var total = EntryUtil.SizeOf(entry); var attempt = 0; var verifyPrefix = true;
+            using (var output = new FileStream(temp, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
             {
-                using (var response = Response(Request("GET", route, 600000)))
-                using (var input = response.GetResponseStream())
-                using (var output = File.Create(temp)) Copy(input, output, EntryUtil.SizeOf(entry), progress);
-                var hash = JsonUtil.Sha256File(temp);
-                if (!DeviceSecurity.Equal(hash, EntryUtil.HashOf(entry))) throw new Exception("文件校验失败：" + EntryUtil.PathOf(entry));
-                return JsonUtil.Obj("temp", temp, "hash", hash, "size", new FileInfo(temp).Length);
+                if (output.Length > total) output.SetLength(0);
+                if (progress != null) progress(output.Length, total);
+                // A completed partial must be checked again after a process restart.
+                if (output.Length == total) { output.Position = 0; if (!DeviceSecurity.Equal(ResumableTransfers.PrefixHash(output, total), EntryUtil.HashOf(entry))) { output.SetLength(0); if (progress != null) progress(0, total); } }
+                while (output.Length < total)
+                {
+                    var offset = output.Length;
+                    var checkpoint = offset;
+                    try
+                    {
+                        var request = Request("GET", route, 30000);
+                        var end = Math.Min(total, offset + ResumableTransfers.ChunkSize) - 1; request.AddRange(offset, end);
+                        if (verifyPrefix) { output.Position = 0; request.Headers["x-twinsync-prefix"] = ResumableTransfers.PrefixHash(output, offset); }
+                        using (var response = Response(request))
+                        using (var input = response.GetResponseStream())
+                        {
+                            if (response.StatusCode == HttpStatusCode.OK) { output.SetLength(0); Copy(input, output, total, progress); }
+                            else
+                            {
+                                if ((int)response.StatusCode != 206 || response.Headers["Content-Range"] != "bytes " + offset + "-" + end + "/" + total) throw new IOException("对方返回的续传范围无效。");
+                                var buffer = new byte[(int)(end - offset + 1)]; var done = 0;
+                                while (done < buffer.Length) { if (check != null) check(); var n = input.Read(buffer, done, buffer.Length - done); if (n == 0) throw new EndOfStreamException("下载中断。"); done += n; }
+                                string hash; using (var sha = System.Security.Cryptography.SHA256.Create()) hash = ResumableTransfers.Hex(sha.ComputeHash(buffer));
+                                if (!DeviceSecurity.Equal(hash, response.Headers["x-twinsync-block-hash"] ?? "")) throw new IOException("下载分块校验失败。");
+                                if (check != null) check(); output.Position = offset; output.Write(buffer, 0, buffer.Length); output.Flush(true);
+                                checkpoint = output.Length;
+                                if (progress != null) progress(output.Length, total);
+                            }
+                        }
+                        verifyPrefix = false; attempt = 0;
+                    }
+                    catch (Exception error)
+                    {
+                        output.SetLength(checkpoint); output.Flush(true);
+                        var peerError = error as PeerRequestException;
+                        if (peerError != null && peerError.Status == 409 && offset > 0 && verifyPrefix) { output.SetLength(0); if (progress != null) progress(0, total); verifyPrefix = true; continue; }
+                        Backoff(attempt++, error); verifyPrefix = true;
+                    }
+                }
             }
-            catch { try { if (File.Exists(temp)) File.Delete(temp); } catch { } throw; }
+            var finalHash = JsonUtil.Sha256File(temp);
+            if (!DeviceSecurity.Equal(finalHash, EntryUtil.HashOf(entry))) { File.Delete(temp); throw new IOException("文件校验失败：" + EntryUtil.PathOf(entry)); }
+            return JsonUtil.Obj("temp", temp, "hash", finalHash, "size", total);
         }
         public JObject Upload(string folderId, JObject entry, string source, bool resolution, Action<long, long> progress = null)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                try { return UploadResumable(folderId, entry, source, progress); }
+                catch (PeerRequestException error) { if (error.Status == 404 || error.Status == 405 || error.Status == 501) return UploadLegacy(folderId, entry, source, resolution, progress); Backoff(attempt, error); }
+                catch (Exception error) { Backoff(attempt, error); }
+            }
+        }
+        private JObject UploadResumable(string folderId, JObject entry, string source, Action<long, long> progress)
+        {
+            var body = JsonUtil.Obj("folder", folderId, "entry", entry.DeepClone());
+            var state = RequestJson("/peer/transfers/start", HttpMethod.Post, body, 600000);
+            if (JsonUtil.GetBool(state["complete"], false)) { if (progress != null) progress(EntryUtil.SizeOf(entry), EntryUtil.SizeOf(entry)); return state; }
+            using (var input = File.OpenRead(source))
+            {
+                var offset = (long)state["offset"]; var total = EntryUtil.SizeOf(entry);
+                if (input.Length != total || offset < 0 || offset > total) throw new IOException("文件大小或续传位置已变化。");
+                if (!DeviceSecurity.Equal(ResumableTransfers.PrefixHash(input, offset, check), (string)state["prefixHash"])) { body["reset"] = true; state = RequestJson("/peer/transfers/start", HttpMethod.Post, body, 600000); offset = 0; }
+                input.Position = offset; if (progress != null) progress(offset, total);
+                var buffer = new byte[ResumableTransfers.ChunkSize]; var id = (string)state["id"];
+                while (offset < total)
+                {
+                    var count = (int)Math.Min(buffer.Length, total - offset); var read = 0;
+                    while (read < count) { if (check != null) check(); var n = input.Read(buffer, read, count - read); if (n == 0) throw new IOException("源文件在传输时被截断。"); read += n; }
+                    string hash; using (var sha = System.Security.Cryptography.SHA256.Create()) hash = ResumableTransfers.Hex(sha.ComputeHash(buffer, 0, count));
+                    var request = Request("PUT", "/peer/transfers/" + id + "?offset=" + offset + "&hash=" + hash, 30000);
+                    request.AllowWriteStreamBuffering = false; request.ContentType = "application/octet-stream"; request.ContentLength = count;
+                    using (var output = request.GetRequestStream()) for (var i = 0; i < count; i += 65536) { if (check != null) check(); output.Write(buffer, i, Math.Min(65536, count - i)); if (progress != null) progress(offset + Math.Min(i + 65536, count), total); }
+                    var ack = ReadJson(request); if ((long)ack["offset"] != offset + count) throw new IOException("分块确认位置无效。"); offset += count;
+                }
+                if (check != null) check();
+                return RequestJson("/peer/transfers/" + id + "/commit", HttpMethod.Post, new JObject(), 600000);
+            }
+        }
+        private JObject UploadLegacy(string folderId, JObject entry, string source, bool resolution, Action<long, long> progress)
         {
             var query = "folder=" + Uri.EscapeDataString(folderId) + "&path=" + Uri.EscapeDataString(EntryUtil.PathOf(entry)) + "&rev=" + EntryUtil.RevOf(entry) + "&origin=" + Uri.EscapeDataString(EntryUtil.OriginOf(entry)) + "&mtime=" + (long)EntryUtil.MtimeOf(entry) + "&hash=" + Uri.EscapeDataString(EntryUtil.HashOf(entry)) + "&size=" + new FileInfo(source).Length + (resolution ? "&resolution=1" : "");
             var request = Request("PUT", "/peer/file?" + query, 600000);

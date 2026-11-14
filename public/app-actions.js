@@ -317,14 +317,6 @@ function openPeerFoldersModal(peer) {
   });
 }
 
-function decodeTextBuffer(buffer) {
-  const bytes = new Uint8Array(buffer);
-  for (let index = 0; index < bytes.length; index += 1) {
-    if (bytes[index] === 0) return null;
-  }
-  return new TextDecoder('utf-8').decode(bytes);
-}
-
 function lineDiff(oldText, newText) {
   const before = oldText.split(/\r?\n/);
   const after = newText.split(/\r?\n/);
@@ -394,56 +386,92 @@ async function openFolderVersionsModal(folderId) {
   });
 }
 
-async function openVersionDiff(versionId, folderId, pathValue) {
+let versionDiffState = null;
+let failedRestoreIds = [];
+let versionDiffRequest = 0;
+let restoreInFlight = false;
+async function openVersionDiff(versionId, folderId, pathValue, page = null) {
+  const requestId = ++versionDiffRequest;
+  if (!page) versionDiffState = { versionId, folderId, pathValue, pages: [{ old: 0, current: 0 }], index: 0 };
+  const state = versionDiffState;
+  state.busy = true;
+  const position = state.pages[state.index];
   try {
-    const [versionResponse, currentResponse] = await Promise.all([
-      fetch(`/api/versions/${encodeURIComponent(versionId)}/content`),
-      fetch(`/api/folders/${encodeURIComponent(folderId)}/download?path=${encodeURIComponent(pathValue)}`),
+    const [oldPage, currentPage] = await Promise.all([
+      api(`/api/versions/${encodeURIComponent(versionId)}/preview?offset=${position.old}&stamp=${encodeURIComponent(state.oldStamp || '')}`),
+      api(`/api/folders/${encodeURIComponent(folderId)}/preview?path=${encodeURIComponent(pathValue)}&offset=${position.current}&stamp=${encodeURIComponent(state.currentStamp || '')}`),
     ]);
-    if (!versionResponse.ok) throw new Error('历史版本不可读取');
-    const oldText = decodeTextBuffer(await versionResponse.arrayBuffer());
-    const currentText = currentResponse.ok ? decodeTextBuffer(await currentResponse.arrayBuffer()) : '';
+    if (requestId !== versionDiffRequest) return;
+    if (page && (!state.overlay?.isConnected || state.overlay.dataset.closing === '1')) return;
+    state.oldStamp = oldPage.stamp;
+    state.currentStamp = currentPage.stamp;
+    state.next = oldPage.eof && currentPage.eof ? null : { old: oldPage.nextOffset, current: currentPage.nextOffset };
+    const oldText = oldPage.text || '';
+    const currentText = currentPage.text || '';
     let body;
-    let subtitle = '与当前文件对比';
-    if (oldText === null || currentText === null) {
+    const segmented = state.index > 0 || !oldPage.eof || !currentPage.eof;
+    const subtitle = `与当前文件对比${segmented ? ` · 第 ${state.index + 1} 段` : ''}${currentPage.missing ? ' · 当前文件不存在' : ''}`;
+    if (oldPage.binary || currentPage.binary) {
+      state.next = null;
       body = '<div class="version-binary">这是二进制文件，无法显示文本差异。可以使用「恢复」直接回退。</div>';
     } else if (oldText === currentText) {
-      body = '<div class="version-binary">当前文件与这个历史版本内容相同。</div>';
+      body = `<div class="version-binary">${segmented ? '这一段内容相同。' : '当前文件与这个历史版本内容相同。'}</div>`;
     } else {
       const diff = lineDiff(oldText, currentText);
       if (diff.truncated) {
-        body = '<div class="version-binary">文件较大，未生成逐行差异。可以使用「恢复」回退。</div>';
+        body = `<div class="diff-view"><pre>${esc(oldText)}</pre><hr><pre>${esc(currentText)}</pre></div>`;
       } else {
         body = '<div class="diff-view">' + diff.rows.map((row) => `<div class="diff-row is-${row.type}"><span class="diff-mark">${row.type === 'add' ? '+' : row.type === 'del' ? '−' : ' '}</span><code>${esc(row.text || ' ')}</code></div>`).join('') + '</div><p class="diff-legend"><span class="diff-add">+ 当前版本新增</span><span class="diff-del">− 历史版本删除</span></p>';
       }
     }
-    openModal({
+    if (segmented) body += `<p class="version-note">分段显示：历史文件 ${fmtBytes(position.old)} / ${fmtBytes(oldPage.totalBytes)}，当前文件 ${fmtBytes(position.current)} / ${fmtBytes(currentPage.totalBytes)}。段内差异按当前范围计算。</p>`;
+    const options = {
       title: baseName(pathValue),
       subtitle,
       body,
-      footer: '<button class="btn" type="button" data-modal-close>关闭</button>',
+      footer: `${segmented ? `<button class="btn" type="button" data-action="diff-previous" ${state.index === 0 ? 'disabled' : ''}>上一段</button><button class="btn" type="button" data-action="diff-next" ${state.next ? '' : 'disabled'}>下一段</button>` : ''}<button class="btn" type="button" data-modal-close>关闭</button>`,
       wide: true,
-    });
+      onClose: () => { if (versionDiffState === state) { versionDiffState = null; versionDiffRequest++; } },
+    };
+    if (state.overlay?.isConnected && state.overlay.dataset.closing !== '1') {
+      state.overlay.querySelector('.modal-head p').textContent = subtitle;
+      state.overlay.querySelector('.modal-body').innerHTML = body;
+      state.overlay.querySelector('.modal-foot').innerHTML = options.footer;
+    } else state.overlay = openModal(options);
+    state.displayedIndex = state.index;
   } catch (error) {
+    state.index = state.displayedIndex || 0;
     toast(error.message, 'error');
+  } finally {
+    state.busy = false;
   }
 }
 
-async function restoreVersions(ids) {
+async function restoreVersions(ids, retry = false) {
+  if (restoreInFlight) return;
   if (!ids.length) {
     toast('请选择要恢复的版本', 'warn');
     return;
   }
-  const ok = await confirmDialog({
+  const ok = retry || await confirmDialog({
     title: '恢复历史版本？',
     message: '当前文件会先保存为一份新的历史版本，然后被选中的版本覆盖。恢复后会触发一次同步。',
     confirmText: '恢复版本',
   });
   if (!ok) return;
+  restoreInFlight = true;
   try {
     const result = await api('/api/versions/restore-batch', { method: 'POST', body: { ids } });
     closeAllModals({ force: true });
-    toast(`已恢复 ${result.count} 个版本`);
+    const results = result.results || [];
+    failedRestoreIds = results.filter((item) => !item.success).map((item) => item.id);
+    openModal({
+      title: '恢复结果',
+      subtitle: `成功 ${result.count} 项 · 失败 ${failedRestoreIds.length} 项`,
+      body: `<div class="version-list">${results.map((item) => `<div class="version-row"><div class="version-copy"><strong>${esc(item.path || '历史版本已不存在')}</strong><span>${item.success ? '已恢复' : esc(item.error || '恢复失败')}</span></div><span class="${item.success ? 'diff-add' : 'diff-del'}">${item.success ? '成功' : '失败'}</span></div>`).join('')}</div>`,
+      footer: `<button class="btn" type="button" data-modal-close>关闭</button>${failedRestoreIds.length ? '<button class="btn btn-primary" type="button" data-action="retry-restores">仅重试失败项</button>' : ''}`,
+      wide: true,
+    });
     await refreshState({ quiet: true });
     if (activeView === 'files') {
       fileState.result = null;
@@ -451,6 +479,8 @@ async function restoreVersions(ids) {
     }
   } catch (error) {
     toast(error.message, 'error');
+  } finally {
+    restoreInFlight = false;
   }
 }
 
@@ -742,7 +772,7 @@ function closePanel() {
 
 async function handleActionClick(event) {
   const actionElement = event.target.closest('[data-action]');
-  if (!actionElement) return;
+  if (!actionElement || actionElement.disabled) return;
   const action = actionElement.dataset.action;
   const id = actionElement.dataset.id;
   const folderId = actionElement.dataset.folder;
@@ -826,6 +856,15 @@ async function handleActionClick(event) {
     await openFolderVersionsModal(id);
   } else if (action === 'version-diff') {
     await openVersionDiff(id, actionElement.dataset.folder, actionElement.dataset.path || '');
+  } else if (action === 'diff-next' || action === 'diff-previous') {
+    if (!versionDiffState || versionDiffState.busy) return;
+    const state = versionDiffState;
+    if (action === 'diff-next' && state.next) { state.pages[++state.index] = state.next; }
+    else if (action === 'diff-previous' && state.index > 0) state.index--;
+    else return;
+    await openVersionDiff(state.versionId, state.folderId, state.pathValue, true);
+  } else if (action === 'retry-restores') {
+    await restoreVersions([...failedRestoreIds], true);
   } else if (action === 'version-restore') {
     await restoreVersions([id]);
   } else if (action === 'version-select-all' || action === 'version-select-none') {

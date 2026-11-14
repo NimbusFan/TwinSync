@@ -55,7 +55,7 @@ MIT 允许使用、修改和分发，包括商业使用，要求保留版权及�
 4. Description 可以填写：
 
    ```text
-   Windows file synchronization with a native C# core, local web UI, encrypted device pairing and version history.
+   适用于 Windows 的文件同步工具，提供本地网页管理、设备加密配对和历史版本。
    ```
 
 5. 选择 **Public**。
@@ -100,7 +100,7 @@ git ls-files
 文件列表应为源码、资源、依赖、文档与脚本，不应出现前文列出的运行数据。确认后提交：
 
 ```powershell
-git commit -m "Initial public release"
+git commit -m "发布 TwinSync 首个开源版本"
 ```
 
 ## 5. 推送源码
@@ -168,7 +168,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup.ps1 -InstallerPackage dist/TwinSyncSetup.exe
 git add .
 git diff --cached --stat
-git commit -m "Describe this update"
+git commit -m "完善局域网发现、断点续传和运行诊断"
 git push
 ```
 

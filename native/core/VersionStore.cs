@@ -13,7 +13,9 @@ namespace TwinSync.Native
         private readonly ConfigStore config;
         private JArray items;
         private readonly object gate = new object();
-        private readonly HashSet<string> pinned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> pinned = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, JObject> reserved = new Dictionary<string, JObject>();
+        private readonly Dictionary<string, int> reservations = new Dictionary<string, int>();
         private DateTime lastMaintenance = DateTime.MinValue;
 
         public VersionStore(ConfigStore config)
@@ -70,7 +72,7 @@ namespace TwinSync.Native
         private HashSet<string> References()
         {
             var references = new HashSet<string>(items.OfType<JObject>().Select(item => JsonUtil.GetString(item["hash"], "")), StringComparer.OrdinalIgnoreCase);
-            references.UnionWith(pinned); return references;
+            references.UnionWith(pinned.Keys); return references;
         }
 
         private void DeleteUnreferenced(IEnumerable<string> hashes)
@@ -115,7 +117,32 @@ namespace TwinSync.Native
             }
         }
 
-        private JObject FindCore(string id) { return items.OfType<JObject>().FirstOrDefault(item => item["id"].ToString() == id); }
+        private JObject FindCore(string id) { JObject held; return items.OfType<JObject>().FirstOrDefault(item => item["id"].ToString() == id) ?? (reserved.TryGetValue(id, out held) ? held : null); }
+        private void Pin(string hash) { int n; pinned.TryGetValue(hash, out n); pinned[hash] = n + 1; }
+        private void Unpin(string hash) { if (pinned[hash] == 1) pinned.Remove(hash); else pinned[hash]--; }
+        private sealed class Reservation : IDisposable
+        {
+            internal VersionStore Owner; internal string[] Ids;
+            public void Dispose()
+            {
+                var owner = System.Threading.Interlocked.Exchange(ref Owner, null); if (owner == null) return;
+                lock (owner.gate)
+                {
+                    var hashes = Ids.Select(id => (string)owner.reserved[id]["hash"]).ToArray();
+                    foreach (var id in Ids) { owner.Unpin((string)owner.reserved[id]["hash"]); if (--owner.reservations[id] == 0) { owner.reserved.Remove(id); owner.reservations.Remove(id); } }
+                    owner.DeleteUnreferenced(hashes);
+                }
+            }
+        }
+        internal IDisposable Retain(IEnumerable<string> ids)
+        {
+            lock (gate)
+            {
+                var found = ids.Distinct().Select(FindCore).Where(v => v != null).ToArray();
+                foreach (var item in found) { var id = (string)item["id"]; int n; reservations.TryGetValue(id, out n); reservations[id] = n + 1; reserved[id] = (JObject)item.DeepClone(); Pin((string)item["hash"]); }
+                return new Reservation { Owner = this, Ids = found.Select(v => (string)v["id"]).ToArray() };
+            }
+        }
         public JObject Find(string id) { lock (gate) { var item = FindCore(id); return item == null ? null : (JObject)item.DeepClone(); } }
 
         public JObject Restore(string id, JObject folder)
@@ -128,7 +155,7 @@ namespace TwinSync.Native
                 var hash = item["hash"].ToString(); var blob = BlobPath(hash);
                 if (!File.Exists(blob)) throw new Exception("历史版本文件缺失");
                 var target = SafeFiles.Join(folder["path"].ToString(), item["path"].ToString());
-                var expected = AtomicFile.HashOrNull(target); pinned.Add(hash);
+                var expected = AtomicFile.HashOrNull(target); Pin(hash);
                 try
                 {
                     Backup(folder, item["path"].ToString(), "before-restore");
@@ -137,13 +164,22 @@ namespace TwinSync.Native
                     if (retained != null) { retained["restoredAt"] = JsonUtil.NowIso(); retained["restoreCount"] = JsonUtil.GetInt(retained["restoreCount"], 0) + 1; JsonUtil.SaveAtomic(metaFile, items); }
                     return item;
                 }
-                finally { pinned.Remove(hash); DeleteUnreferenced(new[] { hash }); }
+                finally { Unpin(hash); DeleteUnreferenced(new[] { hash }); }
             }
         }
 
         public byte[] Content(string id)
         {
-            lock (gate) { var item = FindCore(id); if (item == null) throw new Exception("历史版本不存在"); return File.ReadAllBytes(BlobPath(item["hash"].ToString())); }
+            using (var input = OpenContent(id))
+            {
+                if (input.Length > 65536) throw new IOException("请使用分段预览或流式下载读取此版本。");
+                using (var output = new MemoryStream()) { input.CopyTo(output); return output.ToArray(); }
+            }
+        }
+
+        internal FileStream OpenContent(string id)
+        {
+            lock (gate) { var item = FindCore(id); if (item == null) throw new IOException("历史版本不存在"); return File.OpenRead(BlobPath((string)item["hash"])); }
         }
         public List<JObject> List(string folderId, string relPath)
         {

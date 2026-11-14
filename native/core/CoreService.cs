@@ -30,7 +30,10 @@ namespace TwinSync.Native
         private readonly List<FileSystemWatcher> watchers = new List<FileSystemWatcher>();
         private readonly object watcherGate = new object();
         private readonly Dictionary<string, object> shareGates = new Dictionary<string, object>();
-        private int watchDirty;
+        private LanDiscovery discovery;
+        private ResumableTransfers transfers;
+        private int maintenanceActive, watchActive;
+        private volatile bool running;
         private DateTime lastAutoAt = DateTime.MinValue;
         private readonly object pairingGate = new object();
         public DeviceSecurity Security { get; private set; }
@@ -59,20 +62,30 @@ namespace TwinSync.Native
             }
             Versions = new VersionStore(Config);
             Engine = new SyncEngine(Config, Indexes, Versions, ValidatePairCode, Security.Fingerprint);
+            discovery = new LanDiscovery(delegate { lock (Engine.ConfigurationGate) return JsonUtil.Obj("id", Config.DeviceId, "name", Config.DeviceName, "port", Port); });
+            transfers = new ResumableTransfers(Config, Engine);
         }
 
         public void Start()
         {
+            running = true;
             server = new HttpServer(PublicDir, Route, Security.Certificate);
+            server.ReportError = error => Engine.AddActivity("error", "连接处理未完成", error.Message, "warn");
             server.Start(Port);
             StartAutomation();
+            discovery.SetEnabled(JsonUtil.GetBool(Config.Settings["discoveryEnabled"], true));
+            Engine.AddActivity("service", "同步服务已启动", "", "info");
         }
 
         public void Stop()
         {
+            var wasRunning = running;
+            running = false;
             if (server != null) server.Stop();
             if (autoTimer != null) autoTimer.Dispose();
             if (watchTimer != null) watchTimer.Dispose();
+            discovery.Dispose();
+            if (wasRunning) Engine.AddActivity("service", "同步服务已退出", "", "info");
             lock (watcherGate)
             {
                 foreach (var watcher in watchers)
@@ -98,21 +111,31 @@ namespace TwinSync.Native
             try
             {
                 var watcher = new FileSystemWatcher(path);
+                var id = folder["id"].ToString();
                 watcher.IncludeSubdirectories = true;
                 watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size;
-                watcher.Changed += delegate { Interlocked.Exchange(ref watchDirty, 1); };
-                watcher.Created += delegate { Interlocked.Exchange(ref watchDirty, 1); };
-                watcher.Deleted += delegate { Interlocked.Exchange(ref watchDirty, 1); };
-                watcher.Renamed += delegate { Interlocked.Exchange(ref watchDirty, 1); };
+                FileSystemEventHandler changed = delegate(object sender, FileSystemEventArgs args) { Engine.Scans.Enqueue(id, path, args.FullPath); };
+                watcher.Changed += changed;
+                watcher.Created += changed;
+                watcher.Deleted += changed;
+                watcher.Renamed += delegate(object sender, RenamedEventArgs args) { Engine.Scans.Enqueue(id, path, args.OldFullPath); Engine.Scans.Enqueue(id, path, args.FullPath); };
+                watcher.Error += delegate { Engine.Scans.Enqueue(id, path, null); };
                 watcher.EnableRaisingEvents = true;
                 watchers.Add(watcher);
+                Engine.Scans.Watching(id, true);
             }
             catch { }
         }
 
         private void AutoTick()
         {
+            if (!running) return;
+            if (Interlocked.Exchange(ref maintenanceActive, 1) != 0) return;
+            try
+            {
             try { Versions.Maintain(); } catch (Exception error) { Engine.AddActivity("version", "版本清理未完成", error.Message, "warn"); }
+            try { transfers.Maintain(); } catch (Exception error) { Engine.AddActivity("error", "续传任务清理未完成", error.Message, "warn"); }
+            discovery.SetEnabled(JsonUtil.GetBool(Config.Settings["discoveryEnabled"], true));
             if (JsonUtil.GetBool(Config.Settings["syncPaused"], false)) return;
             if (!JsonUtil.GetBool(Config.Settings["autoSync"], true)) return;
             if (Config.Peers.Count == 0) return;
@@ -120,6 +143,8 @@ namespace TwinSync.Native
             if ((DateTime.UtcNow - lastAutoAt).TotalSeconds < interval) return;
             lastAutoAt = DateTime.UtcNow;
             ThreadPool.QueueUserWorkItem(delegate { Engine.SyncAll(false); });
+            }
+            finally { if (!running) discovery.SetEnabled(false); Interlocked.Exchange(ref maintenanceActive, 0); }
         }
 
         private void RebuildWatchers()
@@ -130,21 +155,29 @@ namespace TwinSync.Native
             {
                 foreach (var watcher in watchers) { try { watcher.EnableRaisingEvents = false; watcher.Dispose(); } catch { } }
                 watchers.Clear();
+                foreach (var folder in folders) { Engine.Scans.Watching((string)folder["id"], false); Engine.Scans.Enqueue((string)folder["id"], (string)folder["path"], null); }
                 foreach (var folder in folders) WatchFolder(folder);
             }
         }
 
         private void WatchTick()
         {
-            if (Interlocked.Exchange(ref watchDirty, 0) == 0) return;
+            if (!running) return;
+            if (Interlocked.Exchange(ref watchActive, 1) != 0) return;
+            try
+            {
             if (JsonUtil.GetBool(Config.Settings["syncPaused"], false)) return;
             List<JObject> snapshot;
             lock (Engine.ConfigurationGate) snapshot = Config.Folders.OfType<JObject>().ToList();
+            var changed = new List<string>();
             foreach (var folder in snapshot)
             {
-                try { Engine.ScanFolder(folder, false); } catch { }
+                try { if (Engine.ScanPending(folder)) changed.Add((string)folder["id"]); }
+                catch (Exception error) { Engine.AddActivity("error", "文件核对未完成", error.Message, "warn"); }
             }
-            if (Config.Peers.Count > 0 && JsonUtil.GetBool(Config.Settings["autoSync"], true)) ThreadPool.QueueUserWorkItem(delegate { Engine.SyncAll(false); });
+            if (changed.Count > 0 && Config.Peers.Count > 0 && JsonUtil.GetBool(Config.Settings["autoSync"], true)) ThreadPool.QueueUserWorkItem(delegate { Engine.SyncFolders(changed); });
+            }
+            finally { Interlocked.Exchange(ref watchActive, 0); }
         }
 
         private HttpResponse Route(HttpRequest request)
@@ -235,7 +268,15 @@ namespace TwinSync.Native
             var versionRestore = Regex.Match(request.Path, "^/api/versions/([0-9a-fA-F-]{36})/restore$");
             if (versionRestore.Success && request.Method == "POST") return RestoreVersion(versionRestore.Groups[1].Value);
             if (request.Path == "/api/versions/restore-batch" && request.Method == "POST") return RestoreBatch(request);
-            if (request.Path == "/api/activity" && request.Method == "GET") return HttpResponse.Json(JsonUtil.Obj("ok", true, "activity", Engine.Activity), 200);
+            if (request.Path == "/api/activity" && request.Method == "GET") return HttpResponse.Json(JsonUtil.Obj("ok", true, "activity", Engine.Journal.Read(request.Query.ContainsKey("limit") ? JsonUtil.GetInt(request.Query["limit"], 300) : 300)), 200);
+            if (request.Path == "/api/diagnostics/export" && request.Method == "GET")
+            {
+                HttpResponse response;
+                lock (Engine.ConfigurationGate) response = HttpResponse.Json(Engine.Journal.Export(Engine.Status), 200);
+                response.Headers["Content-Disposition"] = "attachment; filename=TwinSync-diagnostics.json";
+                return response;
+            }
+            if (Regex.IsMatch(request.Path, "^/api/versions/[0-9a-fA-F-]{36}/preview$") || Regex.IsMatch(request.Path, "^/api/folders/[0-9a-fA-F-]{36}/preview$")) return Preview(request);
             if (request.Path == "/api/conflicts" && request.Method == "GET") return HttpResponse.Json(JsonUtil.Obj("ok", true, "conflicts", ((JObject)BuildState())["conflicts"]), 200);
             return null;
         }
@@ -342,7 +383,7 @@ namespace TwinSync.Native
                 if (request.Path == "/peer/ping")
                 {
                     var folders = new JArray(Config.Folders.OfType<JObject>().Where(folder => SharedWith(folder, peer)).Select(folder => JsonUtil.Obj("id", folder["id"], "name", folder["name"], "mode", folder["mode"], "shared", true)));
-                    return HttpResponse.Json(JsonUtil.Obj("ok", true, "device", JsonUtil.Obj("id", Config.DeviceId, "name", Config.DeviceName), "folders", folders), 200);
+                    return HttpResponse.Json(JsonUtil.Obj("ok", true, "features", new JArray("resume-v1"), "device", JsonUtil.Obj("id", Config.DeviceId, "name", Config.DeviceName), "folders", folders), 200);
                 }
                 if (request.Path == "/peer/manifest" && request.Method == "GET")
                 {
@@ -353,6 +394,7 @@ namespace TwinSync.Native
                 }
                 if (request.Path == "/peer/file" && request.Method == "GET") return PeerDownload(peer, request);
                 if (request.Path == "/peer/file" && request.Method == "PUT") return PeerUpload(peer, request);
+                if (request.Path.StartsWith("/peer/transfers", StringComparison.Ordinal)) return transfers.Route(peer, request);
                 if (request.Path == "/peer/ack" && request.Method == "POST")
                 {
                     var body = JObject.Parse(request.ReadBodyString(4 * 1024 * 1024));
@@ -403,10 +445,35 @@ namespace TwinSync.Native
             if (entry == null || EntryUtil.Deleted(entry)) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件不存在"), 404);
             var path = SafePath(JsonUtil.GetString(folder["path"], ""), EntryUtil.PathOf(entry));
             if (!File.Exists(path)) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件不存在"), 404);
-            var response = new HttpResponse { FilePath = path, ContentType = "application/octet-stream", CheckAccess = Engine.TransferGuard(peer, folder) };
+            var guard = Engine.TransferGuard(peer, folder); guard();
+            var expected = request.Query.ContainsKey("hash") ? request.Query["hash"] : "";
+            if (!string.IsNullOrEmpty(expected) && !DeviceSecurity.Equal(expected, EntryUtil.HashOf(entry))) return HttpResponse.Json(JsonUtil.Obj("error", "源文件已变化，请重新核对。"), 409);
+            var input = File.OpenRead(path);
+            HttpResponse response;
+            try
+            {
+                if (input.Length != EntryUtil.SizeOf(entry) || Math.Abs(new DateTimeOffset(File.GetLastWriteTimeUtc(path)).ToUnixTimeMilliseconds() - EntryUtil.MtimeOf(entry)) > 1) throw new IOException("源文件已变化，请重新核对。");
+                response = new HttpResponse { ContentStream = input, ContentType = "application/octet-stream", CheckAccess = guard };
+                string range;
+                if (request.Headers.TryGetValue("Range", out range))
+                {
+                    var match = Regex.Match(range, "^bytes=([0-9]+)-([0-9]*)$"); long start, end;
+                    if (!match.Success || !long.TryParse(match.Groups[1].Value, out start) || start < 0 || start >= input.Length) throw new IOException("续传位置无效。");
+                    if (match.Groups[2].Length == 0) end = input.Length - 1;
+                    else if (!long.TryParse(match.Groups[2].Value, out end) || end < start || end >= input.Length) throw new IOException("续传范围无效。");
+                    string prefix;
+                    if (request.Headers.TryGetValue("x-twinsync-prefix", out prefix) && !DeviceSecurity.Equal(ResumableTransfers.PrefixHash(input, start, guard), prefix)) throw new IOException("续传前缀校验失败。");
+                    response.Status = 206; response.FileOffset = start; response.FileLength = end - start + 1;
+                    response.Headers["Content-Range"] = "bytes " + start + "-" + end + "/" + input.Length;
+                    if (response.FileLength <= ResumableTransfers.ChunkSize) { input.Position = start; response.Headers["x-twinsync-block-hash"] = ResumableTransfers.PrefixHash(input, response.FileLength); }
+                    input.Position = 0;
+                }
+            }
+            catch (Exception error) { input.Dispose(); return HttpResponse.Json(JsonUtil.Obj("error", error.Message), 409); }
+            response.Headers["Accept-Ranges"] = "bytes";
             response.Headers["x-twinsync-hash"] = EntryUtil.HashOf(entry);
             response.Headers["x-twinsync-mtime"] = ((long)EntryUtil.MtimeOf(entry)).ToString();
-            response.Headers["x-twinsync-size"] = new FileInfo(path).Length.ToString();
+            response.Headers["x-twinsync-size"] = input.Length.ToString();
             return response;
         }
 
@@ -517,6 +584,7 @@ namespace TwinSync.Native
                 }
                 if (body["maxVersionsPerFile"] != null || body["versionRetentionDays"] != null)
                     try { Versions.Maintain(true); } catch (Exception error) { Engine.AddActivity("version", "版本清理未完成", error.Message, "warn"); }
+                discovery.SetEnabled(JsonUtil.GetBool(Config.Settings["discoveryEnabled"], true));
                 return HttpResponse.Json(JsonUtil.Obj("ok", true, "settings", Config.Settings), 200);
             }
             catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
@@ -627,7 +695,7 @@ namespace TwinSync.Native
 
         private HttpResponse RemoveFolder(JObject folder)
         {
-            Engine.ChangeConfiguration(delegate { Engine.InvalidateFolder(folder); Config.Folders.Remove(folder); Config.Save(); }, false);
+            Engine.ChangeConfiguration(delegate { Engine.InvalidateFolder(folder); Config.Folders.Remove(folder); Config.Save(); Engine.Scans.Forget((string)folder["id"]); }, false);
             RebuildWatchers();
             return HttpResponse.Json(JsonUtil.Obj("ok", true), 200);
         }
@@ -759,11 +827,36 @@ namespace TwinSync.Native
         {
             try
             {
-                var data = Versions.Content(id);
-                var response = new HttpResponse { Body = data, ContentType = data.Contains((byte)0) ? "application/octet-stream" : "text/plain; charset=utf-8" };
+                var response = new HttpResponse { ContentStream = Versions.OpenContent(id), ContentType = "application/octet-stream" };
                 return response;
             }
             catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
+        }
+
+        private HttpResponse Preview(HttpRequest request)
+        {
+            try
+            {
+                if (request.Method != "GET") return HttpResponse.Text("Method not allowed", 405);
+                long offset = 0;
+                if (request.Query.ContainsKey("offset") && !long.TryParse(request.Query["offset"], out offset)) throw new IOException("文本分段位置无效。");
+                var stamp = request.Query.ContainsKey("stamp") ? request.Query["stamp"] : null;
+                var parts = request.Path.Split('/');
+                JObject result;
+                if (parts[2] == "versions")
+                {
+                    using (var input = Versions.OpenContent(parts[3])) result = TextPreview.Read(input, offset, stamp, Versions.Find(parts[3])["hash"].ToString());
+                }
+                else
+                {
+                    var folder = Config.GetFolder(parts[3]); if (folder == null) throw new IOException("文件夹不存在");
+                    var path = SafePath((string)folder["path"], request.Query.ContainsKey("path") ? request.Query["path"] : "");
+                    if (!File.Exists(path)) return HttpResponse.Json(JsonUtil.Obj("missing", true, "text", "", "offset", 0, "nextOffset", 0, "totalBytes", 0, "eof", true), 200);
+                    result = TextPreview.FilePreview(path, offset, stamp);
+                }
+                return HttpResponse.Json(result, 200);
+            }
+            catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 409); }
         }
 
         private HttpResponse RestoreVersion(string id)
@@ -774,7 +867,7 @@ namespace TwinSync.Native
                 if (item == null) throw new Exception("历史版本不存在");
                 var folder = Config.GetFolder(JsonUtil.GetString(item["folderId"], ""));
                 if (folder == null) throw new Exception("文件夹不存在");
-                Engine.ChangeConfiguration(delegate { Versions.Restore(id, folder); Engine.ScanFolder(folder, true); });
+                Engine.ChangeConfiguration(delegate { Versions.Restore(id, folder); Scanner.ScanPaths(folder, Engine.IndexFor(folder), Config, new[] { (string)item["path"] }); });
                 return HttpResponse.Json(JsonUtil.Obj("ok", true), 200);
             }
             catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
@@ -786,16 +879,19 @@ namespace TwinSync.Native
             {
                 var body = JObject.Parse(request.ReadBodyString(1024 * 1024));
                 var ids = body["ids"] as JArray;
-                var count = 0;
-                if (ids != null)
+                if (ids == null || ids.Count == 0 || ids.Count > 200 || ids.Any(v => v.Type != JTokenType.String)) throw new Exception("请选择 1 至 200 个历史版本。");
+                var count = 0; var results = new JArray();
+                using (Versions.Retain(ids.Select(v => v.ToString())))
+                foreach (var token in ids.Distinct())
                 {
-                    foreach (var token in ids)
-                    {
+                        var item = Versions.Find(token.ToString());
                         var response = RestoreVersion(token.ToString());
                         if (response.Status == 200) count += 1;
-                    }
+                        var error = response.Status == 200 ? null : (string)JObject.Parse(Encoding.UTF8.GetString(response.Body))["error"];
+                        results.Add(JsonUtil.Obj("id", token, "path", item == null ? "" : (string)item["path"], "success", response.Status == 200, "error", error));
                 }
-                return HttpResponse.Json(JsonUtil.Obj("ok", true, "count", count), 200);
+                Engine.AddActivity("version", "批量恢复完成", "成功 " + count + "，失败 " + (results.Count - count), count == results.Count ? "success" : "warn");
+                return HttpResponse.Json(JsonUtil.Obj("ok", true, "count", count, "failed", results.Count - count, "results", results), 200);
             }
             catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
         }
@@ -1030,7 +1126,8 @@ namespace TwinSync.Native
                 "folders", folders,
                 "pendingFolders", Engine.PendingFolders(),
                 "security", JsonUtil.Obj("transport", "TLS 1.2", "fingerprint", Security.Fingerprint, "remoteAccessToken", JsonUtil.GetBool(Config.Settings["allowRemoteUi"], false) ? Security.RemoteToken : null),
-                "nearby", new JArray(),
+                "nearby", new JArray(discovery.Snapshot().OfType<JObject>().Where(item => Config.GetPeer((string)item["id"]) == null)),
+                "discoveryError", discovery.Error == null ? null : "局域网发现暂不可用，请检查网络和防火墙设置。",
                 "pairing", PairingState(),
                 "sync", sync,
                 "activity", Engine.Activity,

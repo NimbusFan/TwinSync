@@ -84,6 +84,9 @@ namespace TwinSync.Native
         public string ContentType = "application/octet-stream";
         public byte[] Body = new byte[0];
         public string FilePath;
+        public Stream ContentStream;
+        public long FileOffset;
+        public long FileLength = -1;
         public Action CheckAccess;
         public readonly Dictionary<string, string> Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -109,6 +112,7 @@ namespace TwinSync.Native
         private volatile bool running;
         private readonly X509Certificate2 certificate;
         private readonly SemaphoreSlim connections = new SemaphoreSlim(32, 32);
+        internal Action<Exception> ReportError;
 
         public HttpServer(string root, Func<HttpRequest, HttpResponse> route, X509Certificate2 certificate)
         {
@@ -175,15 +179,19 @@ namespace TwinSync.Native
                     if (request == null) return;
                     request.IsSecure = secure;
                     HttpResponse response = null;
+                    try
+                    {
                     try { response = route(request); } catch (Exception error) { response = HttpResponse.Text(error.Message, 500); }
                     if (response == null) response = Static(request);
                     // Consume small unused request bodies before close, otherwise Windows can reset a successful response.
                     ((RequestBodyStream)request.Stream).DrainSmallBody();
                     WriteResponse(stream, response);
                     }
+                    finally { if (response != null && response.ContentStream != null) response.ContentStream.Dispose(); }
+                    }
                 }
             }
-            catch (Exception error) { var diagnostic = DiagnosticError; if (diagnostic != null) diagnostic(error); }
+            catch (Exception error) { var diagnostic = DiagnosticError; if (diagnostic != null) diagnostic(error); if (ReportError != null) ReportError(error); }
             finally { connections.Release(); }
         }
 
@@ -286,12 +294,14 @@ namespace TwinSync.Native
 
         private static void WriteResponse(Stream stream, HttpResponse response)
         {
+            using (var input = response.ContentStream ?? (response.FilePath == null ? null : File.OpenRead(response.FilePath)))
+            {
             if (response.CheckAccess != null) response.CheckAccess();
-            var statusText = response.Status == 200 ? "OK" : response.Status == 201 ? "Created" : response.Status == 204 ? "No Content" : response.Status == 400 ? "Bad Request" : response.Status == 401 ? "Unauthorized" : response.Status == 403 ? "Forbidden" : response.Status == 404 ? "Not Found" : response.Status == 405 ? "Method Not Allowed" : response.Status == 409 ? "Conflict" : response.Status == 423 ? "Locked" : "Error";
+            var statusText = response.Status == 200 ? "OK" : response.Status == 206 ? "Partial Content" : response.Status == 201 ? "Created" : response.Status == 204 ? "No Content" : response.Status == 400 ? "Bad Request" : response.Status == 401 ? "Unauthorized" : response.Status == 403 ? "Forbidden" : response.Status == 404 ? "Not Found" : response.Status == 405 ? "Method Not Allowed" : response.Status == 409 ? "Conflict" : response.Status == 423 ? "Locked" : "Error";
             var header = new StringBuilder();
             header.Append("HTTP/1.1 ").Append(response.Status).Append(' ').Append(statusText).Append("\r\n");
             header.Append("Content-Type: ").Append(response.ContentType).Append("\r\n");
-            var length = response.FilePath == null ? response.Body.Length : new FileInfo(response.FilePath).Length;
+            var length = input == null ? response.Body.Length : response.FileLength < 0 ? input.Length - response.FileOffset : response.FileLength;
             header.Append("Content-Length: ").Append(length).Append("\r\n");
             header.Append("Cache-Control: no-store\r\n");
             header.Append("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\n");
@@ -301,21 +311,23 @@ namespace TwinSync.Native
             header.Append("\r\n");
             var headerBytes = Encoding.ASCII.GetBytes(header.ToString());
             stream.Write(headerBytes, 0, headerBytes.Length);
-            if (response.FilePath != null)
+            if (input != null)
             {
-                using (var file = File.OpenRead(response.FilePath))
-                {
+                    input.Position = response.FileOffset;
                     var buffer = new byte[65536];
-                    int read;
-                    while ((read = file.Read(buffer, 0, buffer.Length)) > 0)
+                    long remaining = length;
+                    while (remaining > 0)
                     {
+                        var read = input.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+                        if (read == 0) throw new EndOfStreamException();
                         if (response.CheckAccess != null) response.CheckAccess();
                         stream.Write(buffer, 0, read);
+                        remaining -= read;
                     }
-                }
             }
             else if (response.Body.Length > 0) stream.Write(response.Body, 0, response.Body.Length);
             stream.Flush();
+            }
         }
     }
 }

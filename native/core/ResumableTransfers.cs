@@ -1,0 +1,163 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json.Linq;
+
+namespace TwinSync.Native
+{
+    internal sealed class ResumableTransfers
+    {
+        internal const int ChunkSize = 4 * 1024 * 1024;
+        private readonly ConfigStore config;
+        private readonly SyncEngine engine;
+        private readonly string directory;
+        private readonly object[] gates = Enumerable.Range(0, 64).Select(i => new object()).ToArray();
+        private readonly object createGate = new object();
+        private DateTime lastCleanup;
+        internal ResumableTransfers(ConfigStore config, SyncEngine engine) { this.config = config; this.engine = engine; directory = Path.Combine(config.Home, "transfers"); Directory.CreateDirectory(directory); }
+        internal static string Digest(string text) { using (var sha = SHA256.Create()) return Hex(sha.ComputeHash(Encoding.UTF8.GetBytes(text))); }
+        internal static string Hex(byte[] bytes) { return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant(); }
+        internal static string PrefixHash(string path, long length, Action check = null)
+        {
+            using (var input = File.OpenRead(path)) return PrefixHash(input, length, check);
+        }
+        internal static string PrefixHash(Stream input, long length, Action check = null)
+        {
+            using (var sha = SHA256.Create())
+            {
+                var buffer = new byte[65536];
+                while (length > 0) { if (check != null) check(); var n = input.Read(buffer, 0, (int)Math.Min(buffer.Length, length)); if (n == 0) throw new EndOfStreamException(); sha.TransformBlock(buffer, 0, n, null, 0); length -= n; }
+                sha.TransformFinalBlock(new byte[0], 0, 0); return Hex(sha.Hash);
+            }
+        }
+        private string Meta(string id) { return SafeFiles.Join(directory, id + ".json"); }
+        private static string Part(JObject folder, string id) { return SafeFiles.Join((string)folder["path"], ".twinsync-part-" + id); }
+        private object Gate(string id) { return gates[Convert.ToInt32(id.Substring(0, 2), 16) % gates.Length]; }
+        internal HttpResponse Route(JObject peer, HttpRequest request)
+        {
+            try
+            {
+                if (request.Path == "/peer/transfers/start" && request.Method == "POST") return Start(peer, JObject.Parse(request.ReadBodyString(16384)));
+                var match = Regex.Match(request.Path, "^/peer/transfers/([a-f0-9]{64})(/commit)?$");
+                if (!match.Success) return HttpResponse.Text("Not found", 404);
+                var id = match.Groups[1].Value;
+                lock (Gate(id))
+                {
+                    var meta = JsonUtil.LoadObject(Meta(id));
+                    if (meta == null || (string)meta["peerId"] != (string)peer["id"]) return HttpResponse.Text("Not found", 404);
+                    var folder = config.GetFolder((string)meta["folderId"]); if (folder == null) throw new OperationCanceledException("文件夹已移除。");
+                    var check = Validate(peer, folder, meta); check();
+                    var part = Part(folder, id); var offset = (long)meta["offset"]; var incoming = (JObject)meta["entry"];
+                    if (match.Groups[2].Success && request.Method == "POST")
+                    {
+                        if (offset != EntryUtil.SizeOf(incoming) || !File.Exists(part) || new FileInfo(part).Length != offset) throw new IOException("文件尚未传输完整。");
+                        if (!DeviceSecurity.Equal(JsonUtil.Sha256File(part), EntryUtil.HashOf(incoming))) throw new IOException("文件校验失败，请重新传输。");
+                        AtomicFile.AssertUnchanged(SafeFiles.Join((string)folder["path"], EntryUtil.PathOf(incoming)), (string)meta["targetHash"]);
+                        var result = engine.AcceptIncomingFile(peer, folder, EntryUtil.PathOf(incoming), incoming, part, check);
+                        File.Delete(Meta(id)); return HttpResponse.Json(result, 200);
+                    }
+                    if (!match.Groups[2].Success && request.Method == "PUT")
+                    {
+                        long requested;
+                        var hash = request.Query.ContainsKey("hash") ? request.Query["hash"] : "";
+                        if (!request.Query.ContainsKey("offset") || !long.TryParse(request.Query["offset"], out requested) || requested != offset || request.ContentLength < 1 || request.ContentLength > ChunkSize || request.ContentLength > EntryUtil.SizeOf(incoming) - offset || !Regex.IsMatch(hash, "^[a-fA-F0-9]{64}$")) throw new IOException("分块位置、长度或校验信息无效。");
+                        using (var output = new FileStream(part, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                        {
+                            if (output.Length < offset) throw new IOException("临时文件不完整，请重新开始传输。");
+                            output.SetLength(offset); output.Position = offset;
+                            try
+                            {
+                                using (var sha = SHA256.Create())
+                                {
+                                    var buffer = new byte[65536]; long remaining = request.ContentLength;
+                                    while (remaining > 0) { check(); var n = request.Stream.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining)); if (n <= 0) throw new EndOfStreamException("传输中断，已保留之前完成的分块。"); check(); sha.TransformBlock(buffer, 0, n, null, 0); output.Write(buffer, 0, n); remaining -= n; }
+                                    sha.TransformFinalBlock(new byte[0], 0, 0);
+                                    if (!DeviceSecurity.Equal(Hex(sha.Hash), hash)) throw new IOException("分块校验失败。");
+                                }
+                                check(); output.Flush(true);
+                                meta["offset"] = offset + request.ContentLength; meta["updatedAt"] = JsonUtil.NowIso(); JsonUtil.SaveAtomic(Meta(id), meta);
+                            }
+                            catch { output.SetLength(offset); output.Flush(true); throw; }
+                        }
+                        return HttpResponse.Json(JsonUtil.Obj("ok", true, "offset", meta["offset"]), 200);
+                    }
+                    return HttpResponse.Text("Method not allowed", 405);
+                }
+            }
+            catch (OperationCanceledException error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 403); }
+            catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 409); }
+        }
+        private Action Validate(JObject peer, JObject folder, JObject meta)
+        {
+            lock (engine.ConfigurationGate)
+            {
+            if ((string)meta["binding"] != Digest(engine.TransferBinding(peer, folder))) throw new OperationCanceledException("同步授权已变更，请重新开始传输。");
+            var incoming = (JObject)meta["entry"]; var local = engine.IndexFor(folder).Get(EntryUtil.PathOf(incoming));
+            if (EntryUtil.HashOf(local) != (string)meta["localHash"] || EntryUtil.Deleted(local) != (bool)meta["localDeleted"]) throw new IOException("本地文件已变化，已保留本地修改。");
+            return engine.TransferGuard(peer, folder, true, EntryUtil.PathOf(incoming));
+            }
+        }
+        private HttpResponse Start(JObject peer, JObject body)
+        {
+            var folder = config.GetFolder((string)body["folder"]); if (folder == null) throw new OperationCanceledException("文件夹不存在。");
+            engine.TransferGuard(peer, folder, true)();
+            var supplied = body["entry"] as JObject; if (supplied == null) throw new IOException("缺少文件信息。");
+            var path = EntryUtil.PathOf(supplied); var hash = EntryUtil.HashOf(supplied); var size = EntryUtil.SizeOf(supplied);
+            if (string.IsNullOrEmpty(path) || path.Length > 4096 || size < 0 || !Regex.IsMatch(hash, "^[a-fA-F0-9]{64}$")) throw new IOException("文件信息无效。");
+            var target = SafeFiles.Join((string)folder["path"], path);
+            var binding = Digest(engine.TransferBinding(peer, folder));
+            JObject before;
+            lock (engine.ConfigurationGate) { var value = engine.IndexFor(folder).Get(path); before = value == null ? null : (JObject)value.DeepClone(); }
+            var id = Digest(peer["id"] + "|" + folder["id"] + "|" + path + "|" + hash + "|" + size + "|" + binding + "|" + EntryUtil.HashOf(before) + "|" + EntryUtil.Deleted(before));
+            lock (Gate(id))
+            {
+                JObject local;
+                lock (engine.ConfigurationGate) { var value = engine.IndexFor(folder).Get(path); local = value == null ? null : (JObject)value.DeepClone(); }
+                if (local != null && !EntryUtil.Deleted(local) && EntryUtil.HashOf(local) == hash && File.Exists(target) && DeviceSecurity.Equal(JsonUtil.Sha256File(target), hash)) return HttpResponse.Json(JsonUtil.Obj("ok", true, "complete", true, "entry", local.DeepClone()), 200);
+                var part = Part(folder, id); var meta = JsonUtil.LoadObject(Meta(id));
+                if (meta != null && JsonUtil.GetBool(body["reset"], false)) { if (File.Exists(part)) File.Delete(part); File.Delete(Meta(id)); meta = null; }
+                if (meta == null)
+                {
+                    lock (createGate)
+                    {
+                        var tasks = Directory.GetFiles(directory, "*.json");
+                        if (tasks.Length >= 128 || tasks.Count(p => { try { return (string)JsonUtil.LoadObject(p)["peerId"] == (string)peer["id"]; } catch { return false; } }) >= 16) throw new IOException("待续传任务过多，请稍后重试。");
+                        var incoming = JsonUtil.Obj("path", path, "type", "file", "size", size, "hash", hash, "mtimeMs", EntryUtil.MtimeOf(supplied), "rev", EntryUtil.RevOf(supplied), "origin", EntryUtil.OriginOf(supplied), "deleted", false, "baseHash", "", "updatedAt", JsonUtil.NowIso());
+                        meta = JsonUtil.Obj("peerId", peer["id"], "folderId", folder["id"], "root", folder["path"], "binding", binding, "entry", incoming, "offset", 0, "localHash", EntryUtil.HashOf(local), "localDeleted", EntryUtil.Deleted(local), "targetHash", File.Exists(target) ? JsonUtil.Sha256File(target) : null, "updatedAt", JsonUtil.NowIso());
+                        using (var file = File.Create(part)) file.Flush(true);
+                        JsonUtil.SaveAtomic(Meta(id), meta);
+                    }
+                }
+                var check = Validate(peer, folder, meta); check();
+                var offset = (long)meta["offset"];
+                if (!File.Exists(part) || new FileInfo(part).Length < offset) { using (var file = File.Create(part)) file.Flush(true); offset = 0; meta["offset"] = 0; }
+                using (var file = new FileStream(part, FileMode.Open, FileAccess.Write, FileShare.None)) file.SetLength(offset);
+                meta["updatedAt"] = JsonUtil.NowIso(); JsonUtil.SaveAtomic(Meta(id), meta);
+                return HttpResponse.Json(JsonUtil.Obj("ok", true, "id", id, "offset", offset, "prefixHash", PrefixHash(part, offset, check), "chunkSize", ChunkSize), 200);
+            }
+        }
+        internal void Maintain()
+        {
+            if (DateTime.UtcNow - lastCleanup < TimeSpan.FromHours(1)) return; lastCleanup = DateTime.UtcNow;
+            foreach (var path in Directory.GetFiles(directory, "*.json"))
+            {
+                var id = Path.GetFileNameWithoutExtension(path); if (!Regex.IsMatch(id, "^[a-f0-9]{64}$")) continue;
+                lock (Gate(id))
+                {
+                    try
+                    {
+                        var meta = JsonUtil.LoadObject(path); DateTime at;
+                        if (meta == null || !DateTime.TryParse((string)meta["updatedAt"], out at) || DateTime.UtcNow - at.ToUniversalTime() < TimeSpan.FromDays(7)) continue;
+                        var root = (string)meta["root"];
+                        if (!string.IsNullOrEmpty(root)) { var part = SafeFiles.Join(root, ".twinsync-part-" + id); if (File.Exists(part)) File.Delete(part); }
+                        File.Delete(path);
+                    }
+                    catch { }
+                }
+            }
+        }
+    }
+}

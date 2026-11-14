@@ -389,9 +389,10 @@ function viewSignature() {
     appState.sync?.lastResult,
     appState.sync?.message,
     appState.startupError,
+    appState.discoveryError,
     appState.activity.slice(0, 4).map((item) => item.id).join('|'),
     appState.conflicts.map((item) => item.id).join('|'),
-    appState.nearby.map((item) => item.id).join('|'),
+    appState.nearby.map((item) => `${item.id}:${item.name}:${item.address}:${item.port}`).join('|'),
     appState.pairing?.code,
     appState.settings?.theme,
   ];
@@ -825,6 +826,7 @@ function renderDevicesView() {
     </div>
 
     ${pendingFolderCards()}
+    ${appState.discoveryError ? `<p class="version-note">${esc(appState.discoveryError)}</p>` : ''}
     <div class="section-head">
       <div><h3>已配对的设备</h3><p>${peers.length ? `${peers.length} 台设备可以访问同步文件夹` : '还没有其他设备'}</p></div>
     </div>
@@ -1058,7 +1060,7 @@ function renderHistoryView() {
   return `
     <div class="page-intro">
       <div><h2>动态</h2></div>
-      <div class="intro-actions"><button class="btn" type="button" data-action="refresh-history">刷新</button></div>
+      <div class="intro-actions"><a class="btn" href="/api/diagnostics/export" download="TwinSync-diagnostics.json">导出诊断</a><button class="btn" type="button" data-action="refresh-history">刷新</button></div>
     </div>
     <div class="history-summary">
       <div class="summary-chip"><span>记录总数</span><strong data-history-total>${fmtNumber(items.length)}</strong></div>

@@ -15,14 +15,26 @@ namespace TwinSync.Native
         };
 
         public static int Scan(JObject folder, IndexStore index, ConfigStore config, bool force)
+        { return ScanCore(folder, index, config, force, null); }
+
+        public static int ScanPaths(JObject folder, IndexStore index, ConfigStore config, IEnumerable<string> paths)
+        {
+            var scopes = paths.Select(p => p.Replace('\\', '/').TrimEnd('/')).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            scopes = scopes.Where(p => !scopes.Any(parent => parent != p && p.StartsWith(parent + "/", StringComparison.OrdinalIgnoreCase))).ToArray();
+            return ScanCore(folder, index, config, true, scopes);
+        }
+
+        private static int ScanCore(JObject folder, IndexStore index, ConfigStore config, bool force, string[] scopes)
         {
             var root = JsonUtil.GetString(folder["path"], "");
             if (!Directory.Exists(root)) throw new Exception("同步目录不存在");
             var matcher = new IgnoreMatcher(folder["ignore"] as JArray);
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var count = 0;
+            var metadataChanged = false;
             SafeFiles.Join(root, "");
-            foreach (var file in SafeFiles.Enumerate(root))
+            var files = scopes == null ? SafeFiles.Enumerate(root) : scopes.SelectMany(relative => ChangedFiles(root, relative));
+            foreach (var file in files)
             {
                 var relative = file.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/');
                 if (matcher.IsIgnored(relative, false)) continue;
@@ -39,6 +51,7 @@ namespace TwinSync.Native
                     : EntryUtil.HashOf(local);
                 if (local != null && !EntryUtil.Deleted(local) && EntryUtil.HashOf(local) == hash && EntryUtil.SizeOf(local) == stat.Length)
                 {
+                    if (EntryUtil.MtimeOf(local) != mtime) metadataChanged = true;
                     local["mtimeMs"] = mtime;
                     continue;
                 }
@@ -59,6 +72,7 @@ namespace TwinSync.Native
             }
             foreach (var entry in index.Entries.Values.ToList())
             {
+                if (scopes != null && !scopes.Any(p => string.Equals(p, EntryUtil.PathOf(entry), StringComparison.OrdinalIgnoreCase) || EntryUtil.PathOf(entry).StartsWith(p + "/", StringComparison.OrdinalIgnoreCase))) continue;
                 if (EntryUtil.Deleted(entry) || seen.Contains(EntryUtil.PathOf(entry))) continue;
                 if (matcher.IsIgnored(EntryUtil.PathOf(entry), false)) continue;
                 var rev = index.NextRev();
@@ -74,8 +88,20 @@ namespace TwinSync.Native
                 count += 1;
             }
             index.LastScanAt = JsonUtil.NowIso();
-            index.Save();
+            if (scopes == null || count > 0 || metadataChanged) index.Save();
             return count;
+        }
+
+        private static IEnumerable<string> ChangedFiles(string root, string relative)
+        {
+            var path = SafeFiles.Join(root, relative);
+            // Exists() suppresses access errors; GetAttributes distinguishes inaccessible from missing.
+            FileAttributes attributes;
+            try { attributes = File.GetAttributes(path); }
+            catch (FileNotFoundException) { return new string[0]; }
+            catch (DirectoryNotFoundException) { return new string[0]; }
+            if ((attributes & FileAttributes.ReparsePoint) != 0) return new string[0];
+            return (attributes & FileAttributes.Directory) != 0 ? SafeFiles.Enumerate(path) : new[] { path };
         }
 
         private sealed class IgnoreMatcher
