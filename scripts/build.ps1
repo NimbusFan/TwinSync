@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+& (Join-Path $PSScriptRoot 'update-readme-themes.ps1')
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $dist = Join-Path $root 'dist'
 $workRoot = Join-Path $root '.build'
@@ -43,9 +44,10 @@ try {
     Copy-Item -LiteralPath $json -Destination (Join-Path $app 'Newtonsoft.Json.dll')
     Copy-Item -LiteralPath $icon -Destination (Join-Path $app 'TwinSync.ico')
     Copy-Item -LiteralPath (Join-Path $root 'public') -Destination (Join-Path $app 'public') -Recurse
-    foreach ($name in @('README.md','LICENSE','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md','SECURITY.md')) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $app $name) }
+    foreach ($name in @('LICENSE','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md','SECURITY.md')) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $app $name) }
+    Copy-Item -LiteralPath (Join-Path $root 'docs/usage.md') -Destination (Join-Path $app 'README.md')
     New-Item -ItemType Directory -Path (Join-Path $app 'docs') | Out-Null
-    foreach ($name in @('security.md','performance.md','publishing.md','release-notes.md')) { Copy-Item -LiteralPath (Join-Path $root ('docs/'+$name)) -Destination (Join-Path $app ('docs/'+$name)) }
+    foreach ($name in @('security.md','performance.md','publishing.md','release-notes.md','usage.md')) { Copy-Item -LiteralPath (Join-Path $root ('docs/'+$name)) -Destination (Join-Path $app ('docs/'+$name)) }
     Copy-Item -LiteralPath (Join-Path $root 'native/lib/LICENSE.Newtonsoft.Json.md') -Destination (Join-Path $app 'LICENSE.Newtonsoft.Json.md')
     $uninstallArgs = @('/nologo','/target:winexe','/optimize+','/platform:anycpu','/define:UNINSTALL',('/out:'+(Join-Path $app 'TwinSyncUninstall.exe')),('/win32icon:'+$icon),('/win32manifest:'+$manifest)) + $setupReferences + $setupSources
     & $compiler @uninstallArgs
@@ -69,12 +71,14 @@ try {
 
     # Source is an explicit allow-list; local configuration, caches and build outputs cannot enter it.
     $sourceFiles = @{}
-    foreach ($name in @('README.md','LICENSE','.gitignore','.gitattributes','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md','SECURITY.md','docs/security.md','docs/performance.md','docs/publishing.md','docs/release-notes.md','native/assets/TwinSync.ico','native/lib/Newtonsoft.Json.dll','native/lib/LICENSE.Newtonsoft.Json.md','native/setup/app.manifest','native/core/app.manifest','native/core/app.config')) { $sourceFiles[$name] = Join-Path $root $name }
+    foreach ($name in @('README.md','README.light.md','LICENSE','.gitignore','.gitattributes','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md','SECURITY.md','docs/security.md','docs/performance.md','docs/publishing.md','docs/release-notes.md','docs/usage.md','native/assets/TwinSync.ico','native/lib/Newtonsoft.Json.dll','native/lib/LICENSE.Newtonsoft.Json.md','native/setup/app.manifest','native/core/app.manifest','native/core/app.config')) { $sourceFiles[$name] = Join-Path $root $name }
     foreach ($directory in @('native/core','native/setup','test')) {
         foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root $directory) -Filter '*.cs' -File) { $sourceFiles[$directory+'/'+$file.Name] = $file.FullName }
     }
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'scripts') -Filter '*.ps1' -File) { $sourceFiles['scripts/'+$file.Name] = $file.FullName }
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'public') -Recurse -File) { $sourceFiles[$file.FullName.Substring($root.Length+1).Replace('\','/')] = $file.FullName }
+    # README gallery assets belong to the source repository, outside the runtime payload.
+    foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'docs/images') -Recurse -File) { $sourceFiles[$file.FullName.Substring($root.Length+1).Replace('\','/')] = $file.FullName }
     $sourceZip = Join-Path $work 'TwinSync-source.zip'
     $archive = [IO.Compression.ZipFile]::Open($sourceZip,[IO.Compression.ZipArchiveMode]::Create)
     try {

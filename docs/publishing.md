@@ -27,6 +27,8 @@ docs/
 
 源码包中包含 `.gitignore` 和 `.gitattributes`，以点开头的文件也要保留。确认 `native/lib/Newtonsoft.Json.dll` 和其许可文件存在，这是离线构建需要的依赖。
 
+仓库首页使用深色版 `README.md`，浅色版为 `README.light.md`。修改正文时编辑 `README.md`；构建脚本会自动同步浅色版本，也可单独执行 `scripts/update-readme-themes.ps1`。提交时应包含两份 README 和 `docs/images/`。
+
 以下内容不应进入仓库：
 
 - 实际运行的 `data/`，其中可能包含设备身份和密钥。

@@ -1,180 +1,141 @@
-# TwinSync
+<div align="center">
 
-面向 Windows 电脑的桌面文件同步工具。
+<img src="public/brand/twinsync-app-icon.svg" width="80" height="80" alt="TwinSync 标识">
 
-使用原生 C# 同步核心，通过本地网页管理设备、同步文件夹和历史版本。关闭网页后，托盘服务继续运行。安装和使用无需 Node.js、npm 或单独安装浏览器运行时。
+<h1>TwinSync</h1>
 
-**Windows 10 / 11 · .NET Framework 4.7.2+ · MIT License**
+<p><strong>两台电脑，文件同步。</strong></p>
+<p>原生 C# 同步核心 · 本地网页管理 · 后台持续运行</p>
 
-[快速开始](#快速开始) · [功能](#功能) · [源码构建](#源码构建) · [当前限制](#当前限制) · [安全说明](docs/security.md) · [参与贡献](CONTRIBUTING.md)
+<p>
+  <img src="docs/images/platform.svg" height="28" alt="Windows 10 / 11">
+  <img src="docs/images/runtime.svg" height="28" alt=".NET Framework 4.7.2+">
+  <a href="LICENSE"><img src="docs/images/license.svg" height="28" alt="MIT License"></a>
+</p>
 
-## 下载
+<p>
+  <a href="https://github.com/NimbusFan/TwinSync/releases"><strong>下载安装</strong></a>
+  &nbsp; · &nbsp; <a href="#快速开始">快速开始</a>
+  &nbsp; · &nbsp; <a href="#界面预览">界面预览</a>
+  &nbsp; · &nbsp; <a href="#构建源码">构建源码</a>
+</p>
 
-在本仓库的 **Releases** 页面下载：
+<p>
+  <a href="README.light.md"><img src="docs/images/theme-light.svg" width="138" height="34" alt="查看浅色版本"></a>
+</p>
 
-| 文件 | 用途 |
-| --- | --- |
-| `TwinSyncSetup.exe` | Windows 安装程序，可选择安装位置 |
-| `TwinSync-source.zip` | 包含源码、前端资源、测试、构建脚本及必要依赖的源码包 |
+<img src="docs/images/overview-dark.png" width="100%" alt="TwinSync 深色概览：同步状态、共享文件夹与设备连接">
 
-安装包和源码包不包含开发者的设备配置、密钥、同步文件、索引或历史版本。
+<p><sub>概览 · 深色主题</sub></p>
+
+</div>
+
+## 界面预览
+
+| 文件夹浏览 | 空间分布 |
+| :---: | :---: |
+| <a href="docs/images/files.png"><img src="docs/images/files.png" alt="深色主题下的文件夹浏览" width="100%"></a> | <a href="docs/images/space.png"><img src="docs/images/space.png" alt="深色主题下的目录空间分布" width="100%"></a> |
+| 按目录进入文件夹，搜索、筛选与定位文件。 | 用色块查看占用大小，点击进入下一层。 |
+
+<details>
+<summary><strong>查看设备配对界面</strong></summary>
+<br>
+<img src="docs/images/devices.png" width="100%" alt="TwinSync 设备页：本机信息、隐藏的配对码和已配对设备">
+<p>设备信息按需展开，配对码默认隐藏，共享范围由用户选择。</p>
+</details>
 
 ## 功能
 
-- **设备配对**：手动填写对方地址、端口，核对设备指纹后使用一次性配对码连接。
-- **文件夹同步**：双向同步、仅发送、仅接收，支持自动同步、定时检查和暂停。
-- **共享范围**：每个文件夹由用户选择本机目录和共享设备；两台电脑可以使用不同路径。
-- **按范围操作**：同步全部内容，也可以只同步指定文件夹或指定设备。
-- **文件浏览**：目录层级、搜索、状态筛选和空间分布视图，支持下载与资源管理器定位。
-- **历史与冲突**：保留历史版本、查看文本差异、恢复文件、批量恢复，以及冲突副本处理。
-- **传输状态**：显示当前文件、字节进度、传输速度和失败原因，可按原范围重试。
-- **后台运行**：Windows 托盘、登录时自动启动、关闭管理面板后继续同步。
-- **界面**：深浅主题、玻璃效果、粒子背景和减少动态效果支持。
+| | |
+| :--- | :--- |
+| **文件同步**<br>双向、仅发送、仅接收，支持自动同步与暂停。 | **设备配对**<br>TLS 1.2 加密，核对设备指纹后使用一次性配对码连接。 |
+| **文件管理**<br>目录浏览、空间分布、搜索、下载与资源管理器定位。 | **版本与冲突**<br>保留历史版本、查看文本差异、恢复文件与处理冲突副本。 |
+| **同步范围**<br>按文件夹选择共享设备，也可只同步指定文件夹或设备。 | **后台运行**<br>Windows 托盘与登录启动，关闭网页后继续同步。 |
 
 ## 快速开始
 
-### 1. 安装与启动
+**1. 安装** — 在两台电脑上运行安装程序，选择安装位置。要求 Windows 10/11 和 .NET Framework 4.7.2 或更高版本。
 
-在两台电脑上运行 `TwinSyncSetup.exe`，选择安装目录。安装完成后，从开始菜单或桌面快捷方式打开 TwinSync。
+**2. 配对** — 为本机命名，填写对方地址与端口，通过可信渠道核对完整设备指纹，再输入一次性配对码。
 
-默认管理地址：
+**3. 选择目录** — 添加本机文件夹，选择同步方向和共享设备。对方收到邀请后，选择自己的本机目录并确认。
 
-```text
-http://127.0.0.1:55220
-```
+**4. 开始同步** — 点击「立即同步」，或保持自动同步开启。两台电脑可以使用不同的本机路径。
 
-首次启动没有预设设备名或同步文件夹。请先在「设备」页面为本机命名。
+默认管理地址：**http://127.0.0.1:55220**。安装与使用无需 Node.js、npm 或单独安装浏览器运行时。
 
-### 2. 配对另一台电脑
+> 同步会传播被授权的文件修改和删除。首次使用建议先用测试文件夹，重要数据另有独立备份。
 
-1. 让两台电脑处于能够互相访问的网络中。
-2. 在对方的「设备」页面展开连接信息，取得地址、端口、设备指纹和配对码。
-3. 在本机点击「连接另一台电脑」，填写信息，并通过可信渠道核对完整指纹。
-4. 完成配对。若无法连接，请检查对方服务是否运行、地址是否正确，以及专用网络的防火墙规则。
+安装、升级、暂停、目录迁移和历史恢复的详细说明见 [使用指南](docs/usage.md)。
 
-设备间通信使用 TLS 1.2，并核验固定设备指纹。配对码为 6 位、有效期 10 分钟，成功后轮换。
+## 下载
 
-### 3. 添加同步文件夹
+前往 **[Releases](https://github.com/NimbusFan/TwinSync/releases)** 选择版本：
 
-1. 在「文件」页面添加本机文件夹，设置显示名称、同步方向和共享设备。
-2. 对方收到共享邀请后，选择自己的本机目录并确认。
-3. 点击「立即同步」，或保持自动同步开启。
+| 文件 | 用途 |
+| --- | --- |
+| `TwinSyncSetup.exe` | Windows 安装程序，支持自选安装位置。 |
+| `TwinSync-source.zip` | 源码、前端资源、文档截图、回归测试与构建依赖。 |
 
-「显示名称（别名）」只影响界面显示，不会修改磁盘上的文件夹名称。配对本身不会授权对方访问任意目录。
+## 构建源码
 
-### 4. 查看结果与处理冲突
+需要 **64 位 Windows 10/11** 和 **.NET Framework 4.7.2+**。构建使用系统 C# 编译器，无需在线恢复依赖。
 
-概览显示同步状态；文件页可以进入目录，或切换为空间分布视图。失败时可查看项目和原因，按原同步范围重试。
-
-双方同时修改文件时，可选择保留冲突副本，或按文件修改时间使用较新版本。修改时间相同则沿用稳定的比较规则。覆盖前是否保留历史版本由设置决定。
-
-同步会传播被授权的文件修改和删除。首次使用建议先用一个测试文件夹熟悉行为；重要文件应另有独立备份。
-
-## 日常使用
-
-### 暂停、共享与目录修改
-
-- 全局暂停、单文件夹暂停和设备暂停分别控制对应范围。
-- 暂停、撤销共享或移除设备、文件夹后，旧任务会重新检查授权并停止。
-- 更换现有同步目录需要确认迁移：复制并校验原文件，保留旧目录，不覆盖新位置中内容不同的同名文件。
-- 迁移完成后，该文件夹保持暂停，核对新目录后再恢复同步。新旧目录不能互相包含。
-- 要同步另一组文件，请添加新的同步文件夹。同步过程中不能修改目录、同步方向或忽略规则。
-
-编辑内容变化后会显示「未保存」；关闭编辑窗口时可选择继续编辑或放弃修改。
-
-### 历史版本与文件写入
-
-文件先写入临时文件并校验 SHA-256，再提交到目标位置。覆盖前检查本地内容，发现传输期间的新编辑时会保留并提示重新核对。已有文件使用原子替换，替换失败不会退回先删除原文件的做法。
-
-历史版本按保留数量和天数清理，并实际回收无引用的备份文件。仍被其他版本引用或正在恢复的内容受到保护。历史版本位于本机，不能代替独立备份。
-
-### 数据保存位置
-
-默认安装位置：
-
-```text
-%LOCALAPPDATA%\Programs\TwinSync
-```
-
-配置、设备身份、索引和历史版本默认保存在安装目录下的 `data` 中。不要把整个身份数据目录复制给另一台电脑；每台电脑应分别安装、命名并配对。
-
-登录自动启动只启动托盘与后台服务，不自动打开浏览器。退出服务请使用托盘菜单或设置页。
-
-### 升级与卸载
-
-升级前先从托盘退出旧服务，再运行新版安装程序。同目录升级保留数据；选择新的安装位置时会复制原配置和历史版本，旧目录数据保留。跨通信协议版本升级时，两端应同时更新并重新配对。
-
-卸载可使用 Windows「已安装的应用」或安装目录中的 `TwinSyncUninstall.exe`。卸载保留配置、历史版本和同步文件。
-
-## 源码构建
-
-需要 64 位 Windows 10/11 和 .NET Framework 4.7.2 或更高版本。构建使用系统自带的 .NET Framework C# 编译器，无需在线恢复依赖。
-
-下载源码或克隆仓库后，在包含 `README.md` 的源码根目录打开 PowerShell：
+在源码根目录打开 PowerShell：
 
 ```powershell
-# 运行全部原生回归测试
+# 运行回归测试
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 
-# 构建安装程序和源码包
+# 生成安装程序与源码包
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
 ```
 
-构建结果：
+输出位于 `dist/TwinSyncSetup.exe` 和 `dist/TwinSync-source.zip`。
+
+<details>
+<summary><strong>项目结构与单独验证</strong></summary>
 
 ```text
-dist/
-  TwinSyncSetup.exe
-  TwinSync-source.zip
-```
-
-构建使用明确的文件清单打包源码，排除运行数据、开发缓存和临时文件。构建中间文件会自动清理。
-
-### 单独运行测试
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-workflows.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup.ps1 -InstallerPackage dist/TwinSyncSetup.exe
-```
-
-资源管理器的真实桌面检查可单独执行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-explorer.ps1 -Desktop
-```
-
-原生测试使用隔离目录与测试设备。真实桌面检查会打开并关闭测试目录的新窗口，保留原有窗口。性能测量的方法和适用范围见 [性能记录](docs/performance.md)。
-
-## 当前限制
-
-- 目前支持 Windows，本地管理页面使用浏览器；不提供 macOS 或 Linux 客户端。
-- 局域网自动发现尚未实现，当前请手动填写地址配对。
-- 暂无断点续传，传输中断后会重新传输该文件。
-- 文件变化仍可能触发完整目录扫描，大目录增量处理有待优化。
-- 大文件版本对比、批量恢复的逐项结果，以及持久化诊断日志仍需完善。
-- 已有隔离回归与本机桌面检查，不代表已完成多种真实网络环境下的长期验证；项目尚未经过独立安全审计。
-
-## 项目结构
-
-```text
-native/
-  core/          同步服务、网络、安全、索引、版本与托盘
-  setup/         安装器与卸载器
-  assets/        Windows 图标
-  lib/           JSON 依赖及许可
+native/core/      同步服务、网络、安全、索引、版本与托盘
+native/setup/     安装器与卸载器
+native/assets/    Windows 图标
+native/lib/       JSON 依赖及许可
 public/          管理界面、字体与品牌资源
 scripts/         构建与测试脚本
 test/            原生回归测试
-docs/            安全、性能与发布说明
+docs/            使用、安全、性能、发布说明与截图
 ```
 
-## 贡献与安全报告
+```powershell
+# 安全与同步流程
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-security.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-workflows.ps1
 
-欢迎通过 Issues 反馈问题，通过 Pull Requests 提交改进。操作步骤和验证要求见 [贡献指南](CONTRIBUTING.md)。安全问题请优先使用 [私密报告方式](SECURITY.md)。
+# 验证实际安装包
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-setup.ps1 -InstallerPackage dist/TwinSyncSetup.exe
 
-首次发布本项目的操作步骤见 [GitHub 发布指南](docs/publishing.md)。
+# 资源管理器真实桌面检查，会打开并关闭测试目录的新窗口
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-explorer.ps1 -Desktop
+```
+
+测试使用隔离数据。请勿把真实同步目录用作测试文件夹。
+
+</details>
+
+## 当前限制
+
+- 目前提供 Windows 客户端；自动发现尚未实现，请手动填写对方地址。
+- 暂无断点续传，中断后会重新传输该文件。
+- 大目录增量扫描、大文件版本对比、批量恢复结果与持久化诊断仍需完善。
+- 已有隔离回归与本机桌面检查，尚未完成广泛的长期真机验证或独立安全审计。
+
+## 文档与贡献
+
+[使用指南](docs/usage.md) · [安全说明](docs/security.md) · [性能记录](docs/performance.md) · [贡献指南](CONTRIBUTING.md) · [GitHub 发布指南](docs/publishing.md)
+
+欢迎通过 [Issues](https://github.com/NimbusFan/TwinSync/issues) 反馈问题，通过 Pull Requests 提交改进。安全问题请使用 [私密报告方式](SECURITY.md)。
 
 ## 许可证
 
-项目代码采用 [MIT License](LICENSE)。第三方 JSON 库和字体适用各自的许可证，详见 [第三方组件说明](THIRD_PARTY_NOTICES.md)。
+项目代码采用 **[MIT License](LICENSE)**。实际使用的 JSON 库和字体适用各自的许可证，详见 [第三方组件说明](THIRD_PARTY_NOTICES.md)。
