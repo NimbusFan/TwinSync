@@ -37,6 +37,7 @@ namespace TwinSync.Native
             foreach (var file in files)
             {
                 var relative = file.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/');
+                if (TransferCache.Reserved(relative)) continue;
                 if (matcher.IsIgnored(relative, false)) continue;
                 FileInfo stat;
                 try { stat = new FileInfo(file); } catch { continue; }
@@ -72,6 +73,7 @@ namespace TwinSync.Native
             }
             foreach (var entry in index.Entries.Values.ToList())
             {
+                if (TransferCache.Reserved(EntryUtil.PathOf(entry))) continue;
                 if (scopes != null && !scopes.Any(p => string.Equals(p, EntryUtil.PathOf(entry), StringComparison.OrdinalIgnoreCase) || EntryUtil.PathOf(entry).StartsWith(p + "/", StringComparison.OrdinalIgnoreCase))) continue;
                 if (EntryUtil.Deleted(entry) || seen.Contains(EntryUtil.PathOf(entry))) continue;
                 if (matcher.IsIgnored(EntryUtil.PathOf(entry), false)) continue;

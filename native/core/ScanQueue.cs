@@ -29,6 +29,7 @@ namespace TwinSync.Native
                 var boundary = root.TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
                 if (!path.StartsWith(boundary, StringComparison.OrdinalIgnoreCase)) { item.Full = true; return; }
                 var relative = path.Substring(boundary.Length).Replace('\\', '/');
+                if (TransferCache.Reserved(relative)) return;
                 if (relative.Split('/').Any(p => p.IndexOf(".twinsync-part-", StringComparison.OrdinalIgnoreCase) >= 0)) return;
                 if (item.Paths.Count >= 4096) { item.Full = true; item.Paths.Clear(); } else item.Paths.Add(relative);
             }

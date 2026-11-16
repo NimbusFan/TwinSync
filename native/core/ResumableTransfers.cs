@@ -17,6 +17,7 @@ namespace TwinSync.Native
         private readonly string directory;
         private readonly object[] gates = Enumerable.Range(0, 64).Select(i => new object()).ToArray();
         private readonly object createGate = new object();
+        private readonly object maintenanceGate = new object();
         private DateTime lastCleanup;
         internal ResumableTransfers(ConfigStore config, SyncEngine engine) { this.config = config; this.engine = engine; directory = Path.Combine(config.Home, "transfers"); Directory.CreateDirectory(directory); Maintain(true); }
         internal static string Digest(string text) { using (var sha = SHA256.Create()) return Hex(sha.ComputeHash(Encoding.UTF8.GetBytes(text))); }
@@ -35,7 +36,7 @@ namespace TwinSync.Native
             }
         }
         private string Meta(string id) { return SafeFiles.Join(directory, id + ".json"); }
-        private static string Part(JObject folder, string id) { return SafeFiles.Join((string)folder["path"], ".twinsync-part-" + id); }
+        private static string Part(JObject folder, string id) { return TransferCache.RecoverUpload((string)folder["path"], id); }
         private object Gate(string id) { return gates[Convert.ToInt32(id.Substring(0, 2), 16) % gates.Length]; }
         internal HttpResponse Route(JObject peer, HttpRequest request)
         {
@@ -118,7 +119,7 @@ namespace TwinSync.Native
             var supplied = body["entry"] as JObject; if (supplied == null) throw new IOException("缺少文件信息。");
             var path = EntryUtil.PathOf(supplied); var hash = EntryUtil.HashOf(supplied); var size = EntryUtil.SizeOf(supplied);
             if (string.IsNullOrEmpty(path) || path.Length > 4096 || size < 0 || !Regex.IsMatch(hash, "^[a-fA-F0-9]{64}$")) throw new IOException("文件信息无效。");
-            var target = SafeFiles.Join((string)folder["path"], path);
+            var target = SafeFiles.UserPath((string)folder["path"], path);
             var binding = Digest(engine.TransferBinding(peer, folder));
             JObject before;
             lock (engine.ConfigurationGate) { var value = engine.IndexFor(folder).Get(path); before = value == null ? null : (JObject)value.DeepClone(); }
@@ -160,7 +161,11 @@ namespace TwinSync.Native
         {
             // Only our reserved cache filename is removable. Never delete the destination entry path.
             var root = JsonUtil.GetString(meta["root"], "");
-            if (!string.IsNullOrEmpty(root)) { var part = SafeFiles.Join(root, ".twinsync-part-" + id); if (File.Exists(part)) File.Delete(part); }
+            if (!string.IsNullOrEmpty(root))
+            {
+                var part = TransferCache.ExistingUpload(root, id); if (File.Exists(part)) File.Delete(part);
+                var legacy = SafeFiles.Join(root, ".twinsync-part-" + id); if (File.Exists(legacy)) File.Delete(legacy);
+            }
             File.Delete(Meta(id));
         }
         private void Reclaim(bool startup, bool pressure)
@@ -185,10 +190,11 @@ namespace TwinSync.Native
                             || EntryUtil.HashOf(current) != (string)meta["localHash"] || EntryUtil.Deleted(current) != JsonUtil.GetBool(meta["localDeleted"], false);
                     }
                     var root = JsonUtil.GetString(meta["root"], "");
-                    var part = string.IsNullOrEmpty(root) ? null : SafeFiles.Join(root, ".twinsync-part-" + id);
+                    if (startup && !obsolete && !expired && offset > 0 && !string.IsNullOrEmpty(root)) TransferCache.RecoverUpload(root, id);
+                    var part = string.IsNullOrEmpty(root) ? null : TransferCache.ExistingUpload(root, id);
                     var missing = part == null || !File.Exists(part);
                     // Empty attempts are not resumable data; reclaim them when starting or admitting another transfer.
-                    if (expired || obsolete || missing || offset == 0 && (startup || pressure && DateTime.UtcNow - at.ToUniversalTime() > TimeSpan.FromSeconds(2))) RemoveCached(id, meta);
+                    if (expired || obsolete || missing || offset == 0 && (startup || DateTime.UtcNow - at.ToUniversalTime() > TimeSpan.FromMinutes(2) || pressure && DateTime.UtcNow - at.ToUniversalTime() > TimeSpan.FromSeconds(2))) RemoveCached(id, meta);
                 }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
@@ -197,10 +203,29 @@ namespace TwinSync.Native
                 finally { System.Threading.Monitor.Exit(taskGate); }
             }
         }
-        internal void Maintain(bool startup = false)
+        internal void Maintain(bool startup = false, bool force = false)
         {
-            if (!startup && DateTime.UtcNow - lastCleanup < TimeSpan.FromHours(1)) return;
-            lastCleanup = DateTime.UtcNow; Reclaim(startup, false);
+            if (!System.Threading.Monitor.TryEnter(maintenanceGate)) return;
+            try
+            {
+                if (!startup && !force && DateTime.UtcNow - lastCleanup < TimeSpan.FromSeconds(30)) return;
+                lastCleanup = DateTime.UtcNow; Reclaim(startup, false);
+                lock (engine.ConfigurationGate)
+                {
+                    var ids = Directory.GetFiles(directory, "*.json").Select(Path.GetFileNameWithoutExtension).ToArray();
+                    foreach (var folder in config.Folders.OfType<JObject>())
+                    {
+                        try
+                        {
+                            var root = (string)folder["path"];
+                            if (startup) TransferCache.MigrateOrphans(root, ids);
+                            TransferCache.Maintain(root, engine.IndexFor(folder));
+                        }
+                        catch (Exception error) { engine.AddActivity("error", "传输缓存维护未完成", error.Message, "warn"); }
+                    }
+                }
+            }
+            finally { System.Threading.Monitor.Exit(maintenanceGate); }
         }
     }
 }

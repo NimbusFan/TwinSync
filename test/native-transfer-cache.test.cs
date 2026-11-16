@@ -53,7 +53,7 @@ namespace TwinSync.Native
             var retained = Json(store.Route(peer, TransferRequest("/peer/transfers/start", JsonUtil.Obj("folder", folder["id"], "entry", CacheEntry(peer, "resume-valid.bin", bytes)))));
             PutBlock(store, peer, retained, bytes.Take(4).ToArray());
             var missing = Json(store.Route(peer, TransferRequest("/peer/transfers/start", JsonUtil.Obj("folder", folder["id"], "entry", CacheEntry(peer, "missing.bin", bytes)))));
-            File.Delete(Path.Combine(dir, ".twinsync-part-" + missing["id"]));
+            File.Delete(TransferCache.Upload(dir, (string)missing["id"]));
             store = new ResumableTransfers(config, engine);
             var resumed = Json(store.Route(peer, TransferRequest("/peer/transfers/start", JsonUtil.Obj("folder", folder["id"], "entry", CacheEntry(peer, "resume-valid.bin", bytes)))));
             Check((long)resumed["offset"] == 4 && (string)resumed["prefixHash"] == BytesHash(bytes.Take(4).ToArray()), "Startup discarded a valid verified partial");

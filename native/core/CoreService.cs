@@ -64,6 +64,7 @@ namespace TwinSync.Native
             Engine = new SyncEngine(Config, Indexes, Versions, ValidatePairCode, Security.Fingerprint);
             discovery = new LanDiscovery(delegate { lock (Engine.ConfigurationGate) return JsonUtil.Obj("id", Config.DeviceId, "name", Config.DeviceName, "port", Port); });
             transfers = new ResumableTransfers(Config, Engine);
+            Engine.AfterSync = delegate { transfers.Maintain(false, true); };
         }
 
         public void Start()
@@ -317,7 +318,7 @@ namespace TwinSync.Native
         private void ValidateFolder(JObject folder, string existingId = null)
         {
             var path = JsonUtil.GetString(folder["path"], "");
-            SafeFiles.Join(path, "");
+            SafeFiles.UserPath(path, "");
             var selected = Path.GetFullPath(path).TrimEnd('\\') + "\\";
             var privateHome = Path.GetFullPath(Config.Home).TrimEnd('\\') + "\\";
             if (selected.StartsWith(privateHome, StringComparison.OrdinalIgnoreCase) || privateHome.StartsWith(selected, StringComparison.OrdinalIgnoreCase)) throw new Exception("同步目录不能包含 TwinSync 的身份、配置和版本数据");
@@ -744,7 +745,7 @@ namespace TwinSync.Native
         private HttpResponse BrowseFolder(HttpRequest request, JObject folder)
         {
             var directory = request.Query.ContainsKey("directory") ? request.Query["directory"].Replace('\\', '/').TrimEnd('/') : "";
-            try { SafeFiles.Join(JsonUtil.GetString(folder["path"], ""), directory); }
+            try { SafeFiles.UserPath(JsonUtil.GetString(folder["path"], ""), directory); }
             catch { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "无效的目录路径"), 400); }
             var prefix = directory.Length > 0 ? directory + "/" : "";
             var query = request.Query.ContainsKey("query") ? request.Query["query"].Trim() : "";
@@ -1146,7 +1147,7 @@ namespace TwinSync.Native
 
         private static string SafePath(string root, string relative)
         {
-            return SafeFiles.Join(root, relative);
+            return SafeFiles.UserPath(root, relative);
         }
     }
 }

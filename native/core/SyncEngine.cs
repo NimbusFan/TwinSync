@@ -25,6 +25,7 @@ namespace TwinSync.Native
         internal object ConfigurationGate { get { return gate; } }
         internal readonly ScanQueue Scans = new ScanQueue();
         internal readonly ActivityJournal Journal;
+        internal Action AfterSync;
         public void ChangeConfiguration(Action action, bool requireIdle = true)
         {
             lock (gate) { if (requireIdle && syncing) throw new Exception("正在同步，请等待本次同步结束后再修改目录设置。"); action(); }
@@ -250,6 +251,7 @@ namespace TwinSync.Native
             finally
             {
                 lock (gate) { syncing = false; Status["transferActive"] = false; Status["speed"] = 0; Status["finishedAt"] = JsonUtil.NowIso(); Status["currentFolder"] = null; Status["currentPeer"] = null; }
+                if (AfterSync != null) try { AfterSync(); } catch (Exception error) { AddActivity("error", "传输缓存维护未完成", error.Message, "warn"); }
             }
         }
 
@@ -333,7 +335,7 @@ namespace TwinSync.Native
                 }
                 return;
             }
-            var downloaded = new PeerClient(peer, Config.DeviceId, check).Download(JsonUtil.GetString(folder["id"], ""), remote, target, TransferProgress("download"));
+            var downloaded = new PeerClient(peer, Config.DeviceId, check).Download(JsonUtil.GetString(folder["id"], ""), remote, target, TransferProgress("download"), (string)folder["path"]);
             var temp = JsonUtil.GetString(downloaded["temp"], "");
             try
             {
@@ -349,7 +351,7 @@ namespace TwinSync.Native
                     index.ObserveRev(EntryUtil.RevOf(entry)); index.Upsert(entry);
                 }
             }
-            finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
+            finally { try { if (File.Exists(temp)) File.Delete(temp); TransferCache.ForgetDownload(temp); } catch { } }
         }
 
         private void Push(JObject peer, JObject folder, IndexStore index, JObject local, JObject remote, Action check)
@@ -543,7 +545,7 @@ namespace TwinSync.Native
 
         public JArray Manifest(JObject folder, JObject peer = null)
         {
-            lock (gate) { if (peer != null) TransferGuard(peer, folder)(); ScanPending(folder); return new JArray(IndexFor(folder).Entries.Values.Select(entry => entry.DeepClone())); }
+            lock (gate) { if (peer != null) TransferGuard(peer, folder)(); ScanPending(folder); return new JArray(IndexFor(folder).Entries.Values.Where(entry => !TransferCache.Reserved(EntryUtil.PathOf(entry))).Select(entry => entry.DeepClone())); }
         }
 
         public void ApplyAcks(JObject folder, JArray entries, JObject peer = null)
@@ -705,7 +707,7 @@ namespace TwinSync.Native
 
         private static string SafePath(string root, string relative)
         {
-            return SafeFiles.Join(root, relative);
+            return SafeFiles.UserPath(root, relative);
         }
     }
 }

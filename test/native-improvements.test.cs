@@ -156,7 +156,7 @@ namespace TwinSync.Native
             Json(store.Route(peer, chunk), 409);
             var again = Json(store.Route(peer, TransferRequest("/peer/transfers/start", body)));
             Check((long)again["offset"] == first.Length && (string)again["prefixHash"] == BytesHash(first), "Interrupted chunk did not roll back to the verified checkpoint");
-            var part = Path.Combine((string)folder["path"], ".twinsync-part-" + key); using (var extra = new FileStream(part, FileMode.Append)) extra.WriteByte(42);
+            var part = TransferCache.Upload((string)folder["path"], key); using (var extra = new FileStream(part, FileMode.Append)) extra.WriteByte(42);
             b.Config.Save(); var reloaded = new CoreService(app, b.Config.Home, b.Port, null, enabled => { }); var recovered = new ResumableTransfers(reloaded.Config, reloaded.Engine); var reloadedPeer = reloaded.Config.GetPeer(a.Config.DeviceId);
             again = Json(recovered.Route(reloadedPeer, TransferRequest("/peer/transfers/start", body)));
             Check((long)again["offset"] == first.Length && new FileInfo(part).Length == first.Length, "Restart did not restore the checkpoint or trim an uncommitted tail");
@@ -187,13 +187,13 @@ namespace TwinSync.Native
             Check(starts >= 2 && offsets.Contains(ResumableTransfers.ChunkSize) && JsonUtil.Sha256File(FilePath(b, id, "network.bin")) == EntryUtil.HashOf(networkEntry), "Transient upload failure did not retry and resume over TLS at the verified offset");
             var remote = b.Engine.IndexFor(folder).Get("network.bin"); var destination = Path.Combine(root, "resume-download.bin");
             Reject(() => new PeerClient(a.Config.GetPeer(b.Config.DeviceId), a.Config.DeviceId).Download(id, remote, destination, (done, total) => { if (done >= ResumableTransfers.ChunkSize) throw new OperationCanceledException("test interruption"); }), "Download interruption was ignored");
-            var downloads = Directory.GetFiles(root, "resume-download.bin.twinsync-part-*"); Check(downloads.Length == 1 && new FileInfo(downloads[0]).Length == ResumableTransfers.ChunkSize, "Verified download block was not retained");
+            var downloads = Directory.GetFiles(Path.Combine(root, TransferCache.Name), "download-*.part"); Check(downloads.Length == 1 && new FileInfo(downloads[0]).Length == ResumableTransfers.ChunkSize, "Verified download block was not retained");
             long resumedAt = -1;
             var downloaded = new PeerClient(a.Config.GetPeer(b.Config.DeviceId), a.Config.DeviceId).Download(id, remote, destination, (done, total) => { if (resumedAt < 0) resumedAt = done; });
             Check(resumedAt == ResumableTransfers.ChunkSize && JsonUtil.Sha256File((string)downloaded["temp"]) == EntryUtil.HashOf(remote), "Ranged download failed to resume at its saved offset");
             File.Delete((string)downloaded["temp"]);
             Reject(() => new PeerClient(a.Config.GetPeer(b.Config.DeviceId), a.Config.DeviceId).Download(id, remote, destination, (done, total) => { if (done >= ResumableTransfers.ChunkSize) throw new OperationCanceledException("test interruption"); }), "Second download interruption was ignored");
-            downloads = Directory.GetFiles(root, "resume-download.bin.twinsync-part-*"); using (var corrupt = new FileStream(downloads[0], FileMode.Open, FileAccess.Write)) corrupt.WriteByte(255);
+            downloads = Directory.GetFiles(Path.Combine(root, TransferCache.Name), "download-*.part"); using (var corrupt = new FileStream(downloads[0], FileMode.Open, FileAccess.Write)) corrupt.WriteByte(255);
             var reset = false;
             downloaded = new PeerClient(a.Config.GetPeer(b.Config.DeviceId), a.Config.DeviceId).Download(id, remote, destination, (done, total) => { if (done == 0) reset = true; });
             Check(reset && JsonUtil.Sha256File((string)downloaded["temp"]) == EntryUtil.HashOf(remote), "Corrupt download prefix was reused or could not recover safely");
@@ -208,7 +208,7 @@ namespace TwinSync.Native
         }
         private static void Improvements(CoreService a, CoreService b, string root, string app)
         {
-            var before = checks; DiscoveryCases(); IncrementalCases(root); PreviewCases(a, root); JournalCases(a, root); BatchCases(a, root); ResumeCases(a, b, root, app); TransferCacheCases(root); FolderContractCases(a, root); SourceSnapshotCases(a, b, root); ResumeProtocolCases(a, b, root); RemovedInvitationCase(a, b, root);
+            var before = checks; DiscoveryCases(); IncrementalCases(root); PreviewCases(a, root); JournalCases(a, root); BatchCases(a, root); ResumeCases(a, b, root, app); TransferCacheCases(root); FolderContractCases(a, root); SourceSnapshotCases(a, b, root); ResumeProtocolCases(a, b, root); RemovedInvitationCase(a, b, root); HiddenCacheCases(root); HiddenCacheLiveCase(a, b, root);
             Console.WriteLine("Discovery, incremental scans, bounded previews, journal, resume and batch regressions passed: " + (checks - before) + " checks.");
         }
     }

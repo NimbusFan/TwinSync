@@ -134,12 +134,12 @@ namespace TwinSync.Native
             if (progress != null) progress(done, total);
         }
 
-        public JObject Download(string folderId, JObject entry, string destination, Action<long, long> progress = null)
+        public JObject Download(string folderId, JObject entry, string destination, Action<long, long> progress = null, string cacheRoot = null)
         {
             var route = "/peer/file?folder=" + Uri.EscapeDataString(folderId) + "&path=" + Uri.EscapeDataString(EntryUtil.PathOf(entry)) + "&hash=" + Uri.EscapeDataString(EntryUtil.HashOf(entry));
             Directory.CreateDirectory(Path.GetDirectoryName(destination));
-            var temp = destination + ".twinsync-part-" + ResumableTransfers.Digest(peer["id"] + "|" + folderId + "|" + EntryUtil.PathOf(entry) + "|" + EntryUtil.HashOf(entry) + "|" + peer["token"]);
-            SafeFiles.Join(Path.GetDirectoryName(destination), Path.GetFileName(temp));
+            var key = ResumableTransfers.Digest(peer["id"] + "|" + folderId + "|" + EntryUtil.PathOf(entry) + "|" + EntryUtil.HashOf(entry) + "|" + peer["token"]);
+            var temp = TransferCache.Download(cacheRoot ?? Path.GetDirectoryName(destination), destination, key, EntryUtil.HashOf(entry));
             var total = EntryUtil.SizeOf(entry); var attempt = 0; var verifyPrefix = true;
             using (var output = new FileStream(temp, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
             {
@@ -184,7 +184,7 @@ namespace TwinSync.Native
                 }
             }
             var finalHash = JsonUtil.Sha256File(temp);
-            if (!DeviceSecurity.Equal(finalHash, EntryUtil.HashOf(entry))) { File.Delete(temp); throw new IOException("文件校验失败：" + EntryUtil.PathOf(entry)); }
+            if (!DeviceSecurity.Equal(finalHash, EntryUtil.HashOf(entry))) { File.Delete(temp); TransferCache.ForgetDownload(temp); throw new IOException("文件校验失败：" + EntryUtil.PathOf(entry)); }
             return JsonUtil.Obj("temp", temp, "hash", finalHash, "size", total);
         }
         public JObject Upload(string folderId, JObject entry, string source, bool resolution, Action<long, long> progress = null)

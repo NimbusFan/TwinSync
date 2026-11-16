@@ -38,7 +38,7 @@ namespace TwinSync.Native
             lock (gate)
             {
                 if (!JsonUtil.GetBool(config.Settings["versioningEnabled"], true)) return null;
-                var source = SafeFiles.Join(folder["path"].ToString(), relPath);
+                var source = SafeFiles.UserPath(folder["path"].ToString(), relPath);
                 if (!File.Exists(source)) return null;
                 var stat = new FileInfo(source); var hash = JsonUtil.Sha256File(source); var blob = BlobPath(hash);
                 if (!File.Exists(blob)) AtomicFile.CopyVerified(source, blob, hash, null, 0, null);
@@ -154,12 +154,12 @@ namespace TwinSync.Native
                 if (item["folderId"].ToString() != folder["id"].ToString()) throw new Exception("历史版本与文件夹不匹配");
                 var hash = item["hash"].ToString(); var blob = BlobPath(hash);
                 if (!File.Exists(blob)) throw new Exception("历史版本文件缺失");
-                var target = SafeFiles.Join(folder["path"].ToString(), item["path"].ToString());
+                var target = SafeFiles.UserPath(folder["path"].ToString(), item["path"].ToString());
                 var expected = AtomicFile.HashOrNull(target); Pin(hash);
                 try
                 {
                     Backup(folder, item["path"].ToString(), "before-restore");
-                    AtomicFile.CopyVerified(blob, target, hash, expected, JsonUtil.GetLong(item["originalMtimeMs"], 0), delegate { SafeFiles.Join(folder["path"].ToString(), item["path"].ToString()); });
+                    AtomicFile.CopyVerified(blob, target, hash, expected, JsonUtil.GetLong(item["originalMtimeMs"], 0), delegate { SafeFiles.UserPath(folder["path"].ToString(), item["path"].ToString()); });
                     var retained = FindCore(id);
                     if (retained != null) { retained["restoredAt"] = JsonUtil.NowIso(); retained["restoreCount"] = JsonUtil.GetInt(retained["restoreCount"], 0) + 1; JsonUtil.SaveAtomic(metaFile, items); }
                     return item;

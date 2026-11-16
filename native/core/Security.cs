@@ -85,6 +85,11 @@ namespace TwinSync.Native
 
     internal static class SafeFiles
     {
+        internal static string UserPath(string root, string relative)
+        {
+            if (TransferCache.Reserved(relative) || TransferCache.Reserved(root)) throw new IOException("传输缓存目录不属于可共享的文件内容。");
+            return Join(root, relative);
+        }
         public static string Join(string root, string relative)
         {
             if (string.IsNullOrWhiteSpace(root) || !Path.IsPathRooted(root)) throw new Exception("请选择本机的绝对目录");
@@ -118,7 +123,7 @@ namespace TwinSync.Native
                 {
                     var attributes = File.GetAttributes(child);
                     if ((attributes & FileAttributes.ReparsePoint) != 0) continue;
-                    if ((attributes & FileAttributes.Directory) != 0) pending.Push(child);
+                    if ((attributes & FileAttributes.Directory) != 0) { if (!TransferCache.Owned(child)) pending.Push(child); }
                     else yield return child;
                 }
             }
