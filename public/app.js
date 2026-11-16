@@ -87,7 +87,7 @@ function connectionDetails() {
 function pendingFolderCards() {
   const offers = appState?.pendingFolders || [];
   if (!offers.length) return '';
-  return `<section class="panel pending-folders"><div class="panel-head"><h2>待确认的文件夹</h2></div>${offers.map(offer => `<div class="pending-folder"><div><strong>${esc(offer.name)}</strong><p>来自 ${esc(peerById(offer.peerId)?.name || '已配对设备')}</p></div><button class="btn btn-sm" data-action="accept-folder-offer" data-id="${esc(offer.id)}" data-peer="${esc(offer.peerId)}">选择本机目录</button></div>`).join('')}</section>`;
+  return `<section class="panel pending-folders" data-folder-offers><div class="panel-head"><div><h2>待确认的共享文件夹</h2><p>选择本机目录后，才会加入下方的文件夹列表。</p></div></div>${offers.map(offer => `<div class="pending-folder"><div><strong>${esc(offer.name)}</strong><p>来自 ${esc(peerById(offer.peerId)?.name || '已配对设备')}</p></div><button class="btn btn-sm" data-action="accept-folder-offer" data-id="${esc(offer.id)}" data-peer="${esc(offer.peerId)}">${folderById(offer.id) ? '确认共享设备' : '选择本机目录'}</button></div>`).join('')}</section>`;
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -392,6 +392,7 @@ function viewSignature() {
     appState.discoveryError,
     appState.activity.slice(0, 4).map((item) => item.id).join('|'),
     appState.conflicts.map((item) => item.id).join('|'),
+    (appState.pendingFolders || []).map((item) => `${item.id}:${item.peerId}:${item.name}`).join('|'),
     appState.nearby.map((item) => `${item.id}:${item.name}:${item.address}:${item.port}`).join('|'),
     appState.pairing?.code,
     appState.settings?.theme,
@@ -875,12 +876,13 @@ function renderFilesView() {
   if (!fileState.folderId || !folderById(fileState.folderId)) { fileState.folderId = appState.folders[0].id; fileState.directory = ''; }
   const folder = folderById(fileState.folderId) || appState.folders[0];
   const folderConflicts = (appState.conflicts || []).filter((item) => item.folderId === folder.id);
+  const sharedNames = (folder.peerIds || []).map(id => peerById(id)?.name || '未命名设备');
   const tabs = appState.folders.map((item) => `<button class="tab ${item.id === folder.id ? 'is-active' : ''}" type="button" data-action="select-folder" data-id="${esc(item.id)}">${esc(item.name)}<span class="count">${fmtNumber(item.fileCount)}</span></button>`).join('');
   return `
     <div class="page-intro files-intro">
       <div>
         <h2>${esc(folder.name)}</h2>
-        <p class="folder-location">${esc(modeLabel(folder.mode))}</p>
+        <p class="folder-location">${esc(modeLabel(folder.mode))} · ${sharedNames.length ? `共享给 ${esc(sharedNames.join('、'))}` : '尚未共享给设备'}</p>
       </div>
       <div class="intro-actions">
         <button class="btn" type="button" data-action="edit-folder" data-id="${esc(folder.id)}">文件夹设置</button>
@@ -888,7 +890,8 @@ function renderFilesView() {
         ${rowMenu('文件夹操作', `<button type="button" data-action="folder-versions" data-id="${esc(folder.id)}">版本历史</button><button type="button" data-action="add-folder">添加文件夹</button><button type="button" data-action="reveal-folder" data-id="${esc(folder.id)}">打开本机目录</button>`)}
       </div>
     </div>
-    ${appState.folders.length > 1 ? `<div class="folder-tabs">${tabs}</div>` : ''}
+    ${pendingFolderCards()}
+    <div class="folder-tabs" role="group" aria-label="本机同步文件夹"><span class="folder-tabs-label">本机文件夹</span>${tabs}</div>
     <div class="toolbar files-toolbar">
       <label class="search-box">${icon('search')}<input id="file-search" type="search" placeholder="搜索文件名或路径…" value="${esc(fileState.query)}" autocomplete="off"></label>
       <div class="filter-chips">
@@ -900,7 +903,7 @@ function renderFilesView() {
       <button class="icon-btn" type="button" title="刷新" data-action="refresh-files">${icon('refresh')}</button>
     </div>
     ${folderConflicts.length ? conflictPanel(folderConflicts, folder) : ''}
-    <div id="files-results">${filesResultsHtml()}</div>${pendingFolderCards()}`;
+    <div id="files-results">${filesResultsHtml()}</div>`;
 }
 
 function fileFilterChip(value, label) {
@@ -1103,7 +1106,7 @@ async function loadHistory() {
   try {
     const data = await api('/api/activity?limit=300');
     if (token !== historyLoadToken) return;
-    historyState.items = data.items || [];
+    historyState.items = Array.isArray(data.activity) ? data.activity : Array.isArray(data.items) ? data.items : [];
   } catch (error) {
     if (token !== historyLoadToken) return;
     historyState.error = error.message;

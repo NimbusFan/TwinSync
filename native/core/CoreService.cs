@@ -314,13 +314,15 @@ namespace TwinSync.Native
             return null;
         }
 
-        private void ValidateFolder(JObject folder)
+        private void ValidateFolder(JObject folder, string existingId = null)
         {
             var path = JsonUtil.GetString(folder["path"], "");
             SafeFiles.Join(path, "");
             var selected = Path.GetFullPath(path).TrimEnd('\\') + "\\";
             var privateHome = Path.GetFullPath(Config.Home).TrimEnd('\\') + "\\";
             if (selected.StartsWith(privateHome, StringComparison.OrdinalIgnoreCase) || privateHome.StartsWith(selected, StringComparison.OrdinalIgnoreCase)) throw new Exception("同步目录不能包含 TwinSync 的身份、配置和版本数据");
+            if (Config.Folders.OfType<JObject>().Any(other => (string)other["id"] != existingId && FolderMigration.Normalize((string)other["path"]).Equals(FolderMigration.Normalize(path), StringComparison.OrdinalIgnoreCase)))
+                throw new Exception("这个本机目录已经用于另一个同步文件夹。请调整已有文件夹的共享设备，或为邀请选择独立目录。");
             if (!new[] { "two-way", "send-only", "receive-only" }.Contains(JsonUtil.GetString(folder["mode"], "two-way"))) throw new Exception("同步方向无效");
             var peerIds = folder["peerIds"] as JArray ?? new JArray();
             if (peerIds.Any(id => Config.GetPeer(id.ToString()) == null)) throw new Exception("只能与已配对设备共享");
@@ -640,6 +642,7 @@ namespace TwinSync.Native
                 }, false);
                 NotifyShares(folder, new JArray());
                 RebuildWatchers();
+                Engine.AddActivity("folder", "已添加同步文件夹", (string)folder["name"], "success");
                 return HttpResponse.Json(JsonUtil.Obj("ok", true, "folder", folder), 201);
             }
             catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
@@ -656,7 +659,7 @@ namespace TwinSync.Native
                 {
                     var candidate = (JObject)folder.DeepClone();
                     foreach (var property in body.Properties()) candidate[property.Name] = property.Value.DeepClone();
-                    ValidateFolder(candidate);
+                    ValidateFolder(candidate, (string)folder["id"]);
                     previous = (JArray)(((folder["peerIds"] as JArray) ?? new JArray()).DeepClone());
                     var permissionsChanged = body.Properties().Any(property => new[] { "paused", "peerIds", "mode", "path", "enabled" }.Contains(property.Name) && !JToken.DeepEquals(folder[property.Name], property.Value));
                     var oldPath = JsonUtil.GetString(folder["path"], "");
@@ -695,8 +698,11 @@ namespace TwinSync.Native
 
         private HttpResponse RemoveFolder(JObject folder)
         {
+            var previous = (JArray)(((folder["peerIds"] as JArray) ?? new JArray()).DeepClone());
             Engine.ChangeConfiguration(delegate { Engine.InvalidateFolder(folder); Config.Folders.Remove(folder); Config.Save(); Engine.Scans.Forget((string)folder["id"]); }, false);
+            NotifyShares(folder, previous);
             RebuildWatchers();
+            Engine.AddActivity("folder", "已移除同步任务", (string)folder["name"], "info");
             return HttpResponse.Json(JsonUtil.Obj("ok", true), 200);
         }
 

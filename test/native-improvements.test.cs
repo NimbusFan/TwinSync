@@ -174,7 +174,7 @@ namespace TwinSync.Native
             chunk = TransferRequest("/peer/transfers/" + key, null, first); chunk.Method = "PUT"; chunk.Query["offset"] = "0"; chunk.Query["hash"] = BytesHash(first);
             Json(store.Route(peer, chunk), 403); Check(!File.Exists(FilePath(b, id, "revoked.bin")), "Regrant revived a revoked resumable session");
             var afterRestart = new CoreService(app, b.Config.Home, b.Port, null, enabled => { });
-            Json(new ResumableTransfers(afterRestart.Config, afterRestart.Engine).Route(afterRestart.Config.GetPeer(a.Config.DeviceId), chunk), 403);
+            Check(new ResumableTransfers(afterRestart.Config, afterRestart.Engine).Route(afterRestart.Config.GetPeer(a.Config.DeviceId), chunk).Status == 404, "Revoked cache entry survived restart");
             Check(true, "Authorization revocation must survive process restart");
 
             File.WriteAllBytes(FilePath(a, id, "network.bin"), data); a.Engine.ScanFolder(a.Config.GetFolder(id), true); var networkEntry = a.Engine.IndexFor(a.Config.GetFolder(id)).Get("network.bin");
@@ -208,7 +208,7 @@ namespace TwinSync.Native
         }
         private static void Improvements(CoreService a, CoreService b, string root, string app)
         {
-            var before = checks; DiscoveryCases(); IncrementalCases(root); PreviewCases(a, root); JournalCases(a, root); BatchCases(a, root); ResumeCases(a, b, root, app);
+            var before = checks; DiscoveryCases(); IncrementalCases(root); PreviewCases(a, root); JournalCases(a, root); BatchCases(a, root); ResumeCases(a, b, root, app); TransferCacheCases(root); FolderContractCases(a, root); SourceSnapshotCases(a, b, root); ResumeProtocolCases(a, b, root); RemovedInvitationCase(a, b, root);
             Console.WriteLine("Discovery, incremental scans, bounded previews, journal, resume and batch regressions passed: " + (checks - before) + " checks.");
         }
     }

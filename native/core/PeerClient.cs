@@ -14,6 +14,7 @@ namespace TwinSync.Native
     }
     internal sealed class PeerClient
     {
+        private sealed class ResumeUnsupportedException : IOException { }
         private readonly JObject peer;
         private readonly string localDeviceId;
         private readonly Action check;
@@ -191,19 +192,24 @@ namespace TwinSync.Native
             for (var attempt = 0; ; attempt++)
             {
                 try { return UploadResumable(folderId, entry, source, progress); }
-                catch (PeerRequestException error) { if (error.Status == 404 || error.Status == 405 || error.Status == 501) return UploadLegacy(folderId, entry, source, resolution, progress); Backoff(attempt, error); }
+                catch (ResumeUnsupportedException) { return UploadLegacy(folderId, entry, source, resolution, progress); }
+                catch (PeerRequestException error) { if (error.Status == 404 && attempt < 3) { if (check != null) check(); System.Threading.Thread.Sleep(100); continue; } Backoff(attempt, error); }
                 catch (Exception error) { Backoff(attempt, error); }
             }
         }
         private JObject UploadResumable(string folderId, JObject entry, string source, Action<long, long> progress)
         {
-            var body = JsonUtil.Obj("folder", folderId, "entry", entry.DeepClone());
-            var state = RequestJson("/peer/transfers/start", HttpMethod.Post, body, 600000);
-            if (JsonUtil.GetBool(state["complete"], false)) { if (progress != null) progress(EntryUtil.SizeOf(entry), EntryUtil.SizeOf(entry)); return state; }
-            using (var input = File.OpenRead(source))
+            // Open the source before allocating a receiver task. Allow atomic replacement while this snapshot is being sent.
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
             {
+                if (input.Length != EntryUtil.SizeOf(entry)) throw new IOException("源文件大小已变化，请重新核对。");
+                var body = JsonUtil.Obj("folder", folderId, "entry", entry.DeepClone());
+                JObject state;
+                try { state = RequestJson("/peer/transfers/start", HttpMethod.Post, body, 600000); }
+                catch (PeerRequestException error) { if (error.Status == 404 || error.Status == 405 || error.Status == 501) throw new ResumeUnsupportedException(); throw; }
+                if (JsonUtil.GetBool(state["complete"], false)) { if (progress != null) progress(EntryUtil.SizeOf(entry), EntryUtil.SizeOf(entry)); return state; }
                 var offset = (long)state["offset"]; var total = EntryUtil.SizeOf(entry);
-                if (input.Length != total || offset < 0 || offset > total) throw new IOException("文件大小或续传位置已变化。");
+                if (offset < 0 || offset > total) throw new IOException("续传位置无效。");
                 if (!DeviceSecurity.Equal(ResumableTransfers.PrefixHash(input, offset, check), (string)state["prefixHash"])) { body["reset"] = true; state = RequestJson("/peer/transfers/start", HttpMethod.Post, body, 600000); offset = 0; }
                 input.Position = offset; if (progress != null) progress(offset, total);
                 var buffer = new byte[ResumableTransfers.ChunkSize]; var id = (string)state["id"];

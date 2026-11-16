@@ -19,6 +19,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
 
 代码位于 `native/` 和 `public/`，测试位于 `test/`，构建与测试入口位于 `scripts/`。现有测试使用独立临时目录；请勿将真实同步目录作为测试数据。
 
+可选的浏览器回归使用真实原生后台，验证活动接口、筛选、共享邀请和文件夹标签。需要本机另有 Node.js 22 或更高版本和 Microsoft Edge，运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-web.ps1`。这两项是浏览器测试工具，不是应用构建或运行依赖。
+
 ## 提交修改
 
 - 每个 Pull Request 聚焦一个问题，说明改动原因、行为变化与验证结果。

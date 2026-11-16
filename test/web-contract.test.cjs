@@ -1,0 +1,50 @@
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const cp = require('child_process');
+const assert = require('assert/strict');
+const stage = path.resolve(process.argv[2]);
+const port = JSON.parse(fs.readFileSync(path.join(stage, 'ready.json'), 'utf8')).port;
+const profile = path.join(stage, 'edge-profile');
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+let browser, socket;
+(async () => {
+  const executable = ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync);
+  if (!executable) throw new Error('Microsoft Edge was not found.');
+  browser = cp.spawn(executable, ['--headless=new', '--no-first-run', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], {windowsHide:true, stdio:'ignore'});
+  const marker = path.join(profile, 'DevToolsActivePort');
+  for (let i=0; i<100 && !fs.existsSync(marker); i++) await wait(100);
+  const debugPort = Number(fs.readFileSync(marker, 'utf8').split('\n')[0]);
+  const tabs = await (await fetch(`http://127.0.0.1:${debugPort}/json/list`)).json();
+  socket = new WebSocket(tabs.find(tab => tab.type === 'page').webSocketDebuggerUrl);
+  await new Promise(resolve => socket.addEventListener('open', resolve, {once:true}));
+  let sequence = 0; const pending = new Map(); const errors = [];
+  socket.addEventListener('message', event => {
+    const data = JSON.parse(event.data);
+    if (data.method === 'Runtime.exceptionThrown') errors.push(data.params.exceptionDetails);
+    const callback = pending.get(data.id);
+    if (callback) { pending.delete(data.id); data.error ? callback.reject(new Error(JSON.stringify(data.error))) : callback.resolve(data.result); }
+  });
+  const send = (method, params={}) => new Promise((resolve,reject) => { const id = ++sequence; pending.set(id,{resolve,reject}); socket.send(JSON.stringify({id,method,params})); });
+  const evaluate = async expression => { const result = await send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true}); if(result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails)); return result.result.value; };
+  const until = async expression => { for(let i=0;i<100;i++) { if(await evaluate(expression)) return; await wait(100); } throw new Error('Timed out: '+expression); };
+  await send('Page.enable'); await send('Runtime.enable'); await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await send('Page.navigate',{url:`http://127.0.0.1:${port}/#history`});
+  await until(`document.querySelector('#history-timeline')?.innerText.includes('可见的同步记录')`);
+  assert(await evaluate(`document.querySelector('#history-timeline').innerText.includes('可见的文件记录')`));
+  await evaluate(`document.querySelector('[data-action="history-filter"][data-filter="file"]').click()`);
+  await until(`document.querySelector('#history-timeline').innerText.includes('可见的文件记录')`);
+  assert(!await evaluate(`document.querySelector('#history-timeline').innerText.includes('可见的同步记录')`));
+  await evaluate(`document.querySelector('[data-view="files"]').click()`);
+  await until(`document.querySelector('[data-folder-offers]') && document.querySelector('#files-results')`);
+  assert(await evaluate(`Boolean(document.querySelector('[data-folder-offers]').compareDocumentPosition(document.querySelector('#files-results')) & Node.DOCUMENT_POSITION_FOLLOWING)`));
+  assert.equal(await evaluate(`document.querySelectorAll('[aria-label="本机同步文件夹"] .tab').length`),1);
+  assert(await evaluate(`document.querySelector('.folder-location').innerText.includes('对方测试设备')`));
+  fs.writeFileSync(path.join(stage, 'add-offer'),'');
+  await until(`document.querySelector('[data-folder-offers]')?.innerText.includes('新收到的邀请')`);
+  assert.equal(await evaluate(`document.querySelectorAll('[aria-label="本机同步文件夹"] .tab').length`),1);
+  assert.equal(errors.length,0,JSON.stringify(errors));
+  console.log('Real-backend browser regression passed: persisted history, filters, folder labels, visible invitations and live invitation updates.');
+  if(process.env.TWINSYNC_WEB_PREVIEW) { const shot = await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(process.env.TWINSYNC_WEB_PREVIEW,Buffer.from(shot.data,'base64')); }
+  await send('Browser.close');
+})().catch(error => {console.error(error);process.exitCode=1;}).finally(() => {if(socket)socket.close();if(browser)browser.kill();});

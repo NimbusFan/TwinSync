@@ -76,6 +76,7 @@ try {
         foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root $directory) -Filter '*.cs' -File) { $sourceFiles[$directory+'/'+$file.Name] = $file.FullName }
     }
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'scripts') -Filter '*.ps1' -File) { $sourceFiles['scripts/'+$file.Name] = $file.FullName }
+    foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'test') -Filter '*.test.cjs' -File) { $sourceFiles['test/'+$file.Name] = $file.FullName }
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'public') -Recurse -File) { $sourceFiles[$file.FullName.Substring($root.Length+1).Replace('\','/')] = $file.FullName }
     # README gallery assets belong to the source repository, outside the runtime payload.
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'docs/images') -Recurse -File) { $sourceFiles[$file.FullName.Substring($root.Length+1).Replace('\','/')] = $file.FullName }

@@ -199,6 +199,8 @@ button:disabled { cursor: default; opacity: .5; }
 
 /* Files */
 .folder-tabs { display: flex; gap: 28px; overflow-x: auto; margin-bottom: 24px; border-bottom: 1px solid var(--line); }
+.folder-tabs-label { flex-shrink: 0; align-self: center; font-size: 14px; color: var(--ink-3); }
+.files-intro + .pending-folders { margin: 0 0 24px; }
 .tab { display: inline-flex; align-items: center; flex-shrink: 0; gap: 10px; min-height: 48px; padding: 0 0 12px; color: var(--ink-3); font-size: 16px; border-bottom: 1px solid transparent; }
 .tab.is-active { color: var(--ink); border-color: var(--ink); }
 .tab .count { font-size: 14px; color: var(--ink-3); }

@@ -10,6 +10,7 @@ try {
     $compileArgs += Get-ChildItem -LiteralPath (Join-Path $appRoot 'native/core') -Filter '*.cs' -File | Where-Object Name -ne 'Program.cs' | ForEach-Object FullName
     $compileArgs += Join-Path $appRoot 'test/native-reliability.test.cs'
     $compileArgs += Join-Path $appRoot 'test/native-improvements.test.cs'
+    $compileArgs += Join-Path $appRoot 'test/native-transfer-cache.test.cs'
     & 'C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe' @compileArgs
     if ($LASTEXITCODE -ne 0) { throw 'Workflow test compilation failed.' }
     Copy-Item -LiteralPath $json -Destination (Join-Path $stage 'Newtonsoft.Json.dll')
