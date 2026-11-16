@@ -119,9 +119,15 @@ namespace TwinSync.Native
             while (pending.Count > 0)
             {
                 var directory = pending.Pop();
-                foreach (var child in Directory.EnumerateFileSystemEntries(directory))
+                string[] children;
+                try { children = Directory.GetFileSystemEntries(directory); }
+                catch (DirectoryNotFoundException) { continue; }
+                foreach (var child in children)
                 {
-                    var attributes = File.GetAttributes(child);
+                    FileAttributes attributes;
+                    try { attributes = File.GetAttributes(child); }
+                    catch (FileNotFoundException) { continue; }
+                    catch (DirectoryNotFoundException) { continue; }
                     if ((attributes & FileAttributes.ReparsePoint) != 0) continue;
                     if ((attributes & FileAttributes.Directory) != 0) { if (!TransferCache.Owned(child)) pending.Push(child); }
                     else yield return child;

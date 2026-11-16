@@ -31,6 +31,10 @@ let modalSequence = 0;
 const modalCloseHandlers = new Map();
 let themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
 let fileRequest = 0;
+let fileLoadPromise = null;
+let fileLoadQueued = false;
+let filesPaintNode = null;
+let filesPaintHtml = '';
 let searchDebounce = null;
 let historyLoadToken = 0;
 let fileMapResizeTimer = 0;
@@ -377,8 +381,16 @@ function applyState(next, { force = false } = {}) {
 
 function viewSignature() {
   if (!appState) return '';
+  if (activeView === 'files') return JSON.stringify([
+    activeView, appState.settings?.theme,
+    appState.folders.map(folder => [folder.id, folder.name, folder.path, folder.mode, folder.enabled, folder.paused, folder.peerIds]),
+    appState.peers.map(peer => [peer.id, peer.name]),
+    (appState.pendingFolders || []).map(item => [item.id, item.peerId, item.name]),
+    appState.conflicts.map(item => item.id),
+    fileState.folderId, fileState.directory, fileState.view, fileState.status,
+  ]);
   const base = [
-    activeView,
+    activeView, appState.settings?.syncPaused,
     appState.folders.map((folder) => `${folder.id}:${folder.name}:${folder.fileCount}:${folder.totalBytes}:${folder.conflictCount}:${folder.state}:${folder.paused}:${folder.path}:${folder.mode}:${folder.peerIds?.join(',')}:${folder.lastSyncAt}:${folder.lastError}`).join('|'),
     appState.peers.map((peer) => `${peer.id}:${peer.online}:${peer.paused}:${peer.name}:${peer.host}`).join('|'),
     appState.stats?.totalFiles,
@@ -555,6 +567,10 @@ function transferLabel(sync) {
 
 function updateLive() {
   if (!appState) return;
+  $$('[data-folder-count]').forEach(element => {
+    const folder = folderById(element.dataset.folderCount);
+    if (folder) element.textContent = fmtNumber(folder.fileCount);
+  });
   const sync = appState.sync || {};
   const conflictCount = appState.conflicts?.length || 0;
   const liveMessage = sync.state === 'syncing' || sync.state === 'scanning'
@@ -877,7 +893,7 @@ function renderFilesView() {
   const folder = folderById(fileState.folderId) || appState.folders[0];
   const folderConflicts = (appState.conflicts || []).filter((item) => item.folderId === folder.id);
   const sharedNames = (folder.peerIds || []).map(id => peerById(id)?.name || '未命名设备');
-  const tabs = appState.folders.map((item) => `<button class="tab ${item.id === folder.id ? 'is-active' : ''}" type="button" data-action="select-folder" data-id="${esc(item.id)}">${esc(item.name)}<span class="count">${fmtNumber(item.fileCount)}</span></button>`).join('');
+  const tabs = appState.folders.map((item) => `<button class="tab ${item.id === folder.id ? 'is-active' : ''}" type="button" data-action="select-folder" data-id="${esc(item.id)}">${esc(item.name)}<span class="count" data-folder-count="${esc(item.id)}">${fmtNumber(item.fileCount)}</span></button>`).join('');
   return `
     <div class="page-intro files-intro">
       <div>
@@ -1000,46 +1016,64 @@ async function openDirectory(directory) {
   browser?.querySelector('[aria-current="location"]')?.focus({ preventScroll: true });
 }
 
-async function loadFiles({ quiet = false } = {}) {
+function fileContext() {
   const folder = currentFolder();
-  if (!folder) {
+  if (!folder) return null;
+  return { folderId: folder.id, query: fileState.query, status: fileState.status,
+    limit: String(fileState.limit), offset: String(fileState.offset), directory: fileState.directory };
+}
+
+async function loadFiles({ quiet = false } = {}) {
+  if (fileLoadPromise) {
+    fileLoadQueued = true;
+    return fileLoadPromise;
+  }
+  const context = fileContext();
+  if (!context) {
     fileState.result = null;
     if (activeView === 'files') paintFilesResults();
     return;
   }
-  if (fileState.folderId !== folder.id) fileState.folderId = folder.id;
+  fileState.folderId = context.folderId;
+  const contextKey = JSON.stringify(context);
   const requestId = ++fileRequest;
   fileState.loading = true;
   fileState.error = null;
   if (!quiet && activeView === 'files') paintFilesResults();
-  try {
-    const params = new URLSearchParams({
-      query: fileState.query,
-      status: fileState.status,
-      limit: String(fileState.limit),
-      offset: String(fileState.offset),
-      directory: fileState.directory,
-    });
-    const data = await api(`/api/folders/${encodeURIComponent(folder.id)}/browse?${params}`);
-    if (requestId !== fileRequest) return;
-    fileState.offset = Math.max(0, Number(data.offset) || 0);
-    fileState.result = { ...data, folderId: folder.id };
-  } catch (error) {
-    if (requestId !== fileRequest) return;
-    fileState.error = error.message;
-    if (!quiet) toast(error.message, 'error');
-  } finally {
-    if (requestId === fileRequest) {
+  fileLoadPromise = (async () => {
+    try {
+      const { folderId, ...query } = context;
+      const data = await api(`/api/folders/${encodeURIComponent(folderId)}/browse?${new URLSearchParams(query)}`);
+      if (requestId !== fileRequest || JSON.stringify(fileContext()) !== contextKey) return;
+      fileState.offset = Math.max(0, Number(data.offset) || 0);
+      fileState.directory = data.directory ?? context.directory;
+      fileState.result = { ...data, folderId };
+    } catch (error) {
+      if (requestId !== fileRequest || JSON.stringify(fileContext()) !== contextKey) return;
+      fileState.error = error.message;
+      if (!quiet) toast(error.message, 'error');
+    } finally {
       fileState.loading = false;
+      fileLoadPromise = null;
       if (activeView === 'files') paintFilesResults();
+      if (fileLoadQueued) {
+        fileLoadQueued = false;
+        if (activeView === 'files') refreshFilesSoon();
+      }
     }
-  }
+  })();
+  return fileLoadPromise;
 }
 
 function paintFilesResults() {
   const container = $('#files-results');
   if (!container) return;
-  container.innerHTML = filesResultsHtml();
+  const html = filesResultsHtml();
+  if (filesPaintNode !== container || filesPaintHtml !== html) {
+    container.innerHTML = html;
+    filesPaintNode = container;
+    filesPaintHtml = html;
+  }
   const count = fileState.result?.total;
   if (typeof count === 'number') {
     const panel = $('.conflict-panel');

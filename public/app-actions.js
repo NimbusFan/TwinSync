@@ -796,6 +796,11 @@ async function handleActionClick(event) {
     const existing = folderById(id);
     if (existing) openFolderModal({ ...existing, peerIds: [...new Set([...existing.peerIds, offer.peerId])] });
     else openFolderModal(null, { name: offer.name, offerId: offer.id, peerIds: [offer.peerId] });
+  } else if (action === 'pause-sync' || action === 'resume-sync') {
+    event.preventDefault();
+    actionElement.disabled = true;
+    try { await setSyncPaused(action === 'pause-sync'); }
+    finally { if (actionElement.isConnected) actionElement.disabled = false; }
   } else if (action === 'sync-now') {
     event.preventDefault();
     startSync();
@@ -914,8 +919,7 @@ async function handleActionClick(event) {
     renderView();
     loadFiles();
   } else if (action === 'refresh-files') {
-    fileState.result = null;
-    await loadFiles();
+    await loadFiles({ quiet: true });
   } else if (action === 'rescan-folder') {
     try {
       await api('/api/scan', { method: 'POST', body: { folderId: id } });

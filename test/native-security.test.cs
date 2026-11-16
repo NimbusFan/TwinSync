@@ -47,7 +47,7 @@ namespace TwinSync.Native
         private static void CheckFileList(CoreService core, string csrf, string root)
         {
             var folder = JsonUtil.Obj("id", JsonUtil.RandomId(), "name", "列表回归", "path", Path.Combine(root, "list-only"), "mode", "two-way", "enabled", true, "paused", true, "peerIds", new JArray());
-            Directory.CreateDirectory(JsonUtil.GetString(folder["path"], ""));
+            Directory.CreateDirectory(Path.Combine(JsonUtil.GetString(folder["path"], ""), "docs"));
             core.Config.Folders.Add(folder);
             var index = core.Engine.IndexFor(folder);
             for (var number = 0; number < 125; number++) index.Upsert(JsonUtil.Obj("path", "docs/file-" + number.ToString("D3") + ".txt", "size", number, "hash", "current-hash", "baseHash", number % 5 == 0 ? "old-hash" : "current-hash", "deleted", false));
@@ -92,9 +92,11 @@ namespace TwinSync.Native
             Check((int)result["fileCount"] == 25 && (long)result["totalBytes"] == 1500, "Directory aggregation honors pending filters before grouping");
             result = Api(core, csrf, browse + "?query=FILE-12", null);
             Check((int)result["fileCount"] == 5 && (int)result["total"] == 1, "Recursive search keeps matching results grouped in their folder");
+            Directory.CreateDirectory(Path.Combine((string)folder["path"], "docs-other"));
             index.Upsert(JsonUtil.Obj("path", "docs-other/extra.txt", "size", 100, "hash", "same", "baseHash", "same"));
             result = Api(core, csrf, browse + "?directory=docs", null);
             Check((int)result["fileCount"] == 125, "Directory prefix cannot include a similarly named sibling");
+            Directory.CreateDirectory(Path.Combine((string)folder["path"], "zeros"));
             index.Upsert(JsonUtil.Obj("path", "zeros/empty.txt", "size", 0, "hash", "same", "baseHash", "same"));
             result = Api(core, csrf, browse + "?directory=zeros", null);
             Check((long)result["totalBytes"] == 0 && (int)result["fileCount"] == 1 && ((JArray)result["mapItems"]).Count == 1, "All-zero directories retain file counts for the chart fallback");

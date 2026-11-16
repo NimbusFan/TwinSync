@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -14,17 +14,17 @@ namespace TwinSync.Native
             "desktop.ini", "thumbs.db", ".ds_store", "~$*", "*.tmp", "*.twinsync-part-*"
         };
 
-        public static int Scan(JObject folder, IndexStore index, ConfigStore config, bool force)
-        { return ScanCore(folder, index, config, force, null); }
+        public static int Scan(JObject folder, IndexStore index, ConfigStore config, bool force, Action check = null, Action<string> retry = null)
+        { return ScanCore(folder, index, config, force, null, check, retry); }
 
-        public static int ScanPaths(JObject folder, IndexStore index, ConfigStore config, IEnumerable<string> paths)
+        public static int ScanPaths(JObject folder, IndexStore index, ConfigStore config, IEnumerable<string> paths, Action check = null, Action<string> retry = null)
         {
             var scopes = paths.Select(p => p.Replace('\\', '/').TrimEnd('/')).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             scopes = scopes.Where(p => !scopes.Any(parent => parent != p && p.StartsWith(parent + "/", StringComparison.OrdinalIgnoreCase))).ToArray();
-            return ScanCore(folder, index, config, true, scopes);
+            return ScanCore(folder, index, config, true, scopes, check, retry);
         }
 
-        private static int ScanCore(JObject folder, IndexStore index, ConfigStore config, bool force, string[] scopes)
+        private static int ScanCore(JObject folder, IndexStore index, ConfigStore config, bool force, string[] scopes, Action check, Action<string> retry)
         {
             var root = JsonUtil.GetString(folder["path"], "");
             if (!Directory.Exists(root)) throw new Exception("同步目录不存在");
@@ -39,17 +39,29 @@ namespace TwinSync.Native
                 var relative = file.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/');
                 if (TransferCache.Reserved(relative)) continue;
                 if (matcher.IsIgnored(relative, false)) continue;
-                FileInfo stat;
-                try { stat = new FileInfo(file); } catch { continue; }
-                if (!stat.Exists) continue;
-                seen.Add(relative);
-                var local = index.Get(relative);
-                var oldSize = local == null ? -1 : EntryUtil.SizeOf(local);
-                var oldMtime = local == null ? 0 : EntryUtil.MtimeOf(local);
-                var mtime = new DateTimeOffset(stat.LastWriteTimeUtc).ToUnixTimeMilliseconds();
-                var hash = local == null || force || oldSize != stat.Length || Math.Abs(oldMtime - mtime) > 1
-                    ? JsonUtil.Sha256File(file)
-                    : EntryUtil.HashOf(local);
+                if (check != null) check();
+                FileInfo stat; JObject local; long mtime; string hash;
+                try
+                {
+                    stat = new FileInfo(file); if (!stat.Exists) continue;
+                    local = index.Get(relative);
+                    mtime = new DateTimeOffset(stat.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+                    hash = local == null || force || EntryUtil.SizeOf(local) != stat.Length || Math.Abs(EntryUtil.MtimeOf(local) - mtime) > 1
+                        ? Hash(file, check) : EntryUtil.HashOf(local);
+                    if (SyncEngine.Missing(file)) continue;
+                    var after = new FileInfo(file);
+                    if (after.Length != stat.Length || after.LastWriteTimeUtc != stat.LastWriteTimeUtc)
+                    { seen.Add(relative); if (retry != null) retry(relative); continue; }
+                    seen.Add(relative);
+                }
+                catch (FileNotFoundException) { continue; }
+                catch (DirectoryNotFoundException) { continue; }
+                catch (IOException error)
+                {
+                    var code = error.HResult & 65535;
+                    if (code != 32 && code != 33) throw;
+                    seen.Add(relative); if (retry != null) retry(relative); continue;
+                }
                 if (local != null && !EntryUtil.Deleted(local) && EntryUtil.HashOf(local) == hash && EntryUtil.SizeOf(local) == stat.Length)
                 {
                     if (EntryUtil.MtimeOf(local) != mtime) metadataChanged = true;
@@ -71,6 +83,8 @@ namespace TwinSync.Native
                 index.Upsert(entry);
                 count += 1;
             }
+            if (check != null) check();
+            if (!Directory.Exists(root)) throw new IOException("同步根目录已不可用，未生成删除记录。");
             foreach (var entry in index.Entries.Values.ToList())
             {
                 if (TransferCache.Reserved(EntryUtil.PathOf(entry))) continue;
@@ -92,6 +106,33 @@ namespace TwinSync.Native
             index.LastScanAt = JsonUtil.NowIso();
             if (scopes == null || count > 0 || metadataChanged) index.Save();
             return count;
+        }
+
+        private static string Hash(string file, Action check)
+        {
+            using (var input = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                var buffer = new byte[65536]; int read;
+                while ((read = input.Read(buffer, 0, buffer.Length)) > 0) { if (check != null) check(); sha.TransformBlock(buffer, 0, read, null, 0); }
+                sha.TransformFinalBlock(new byte[0], 0, 0); return ResumableTransfers.Hex(sha.Hash);
+            }
+        }
+
+        internal static IEnumerable<string> VisibleDirectories(JObject folder, string directory)
+        {
+            var root = (string)folder["path"]; var location = SafeFiles.UserPath(root, directory);
+            var matcher = new IgnoreMatcher(folder["ignore"] as JArray);
+            string[] children;
+            try { children = Directory.GetDirectories(location); } catch (DirectoryNotFoundException) { yield break; }
+            foreach (var child in children)
+            {
+                var relative = child.Substring(root.TrimEnd('\\', '/').Length).TrimStart('\\', '/').Replace('\\', '/');
+                if (TransferCache.Reserved(relative) || matcher.IsIgnored(relative, true) || matcher.IsIgnored(relative + "/", true)) continue;
+                FileAttributes attributes;
+                try { attributes = File.GetAttributes(child); } catch (DirectoryNotFoundException) { continue; } catch (FileNotFoundException) { continue; }
+                if ((attributes & FileAttributes.ReparsePoint) == 0) yield return relative;
+            }
         }
 
         private static IEnumerable<string> ChangedFiles(string root, string relative)

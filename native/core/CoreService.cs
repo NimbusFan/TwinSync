@@ -174,6 +174,7 @@ namespace TwinSync.Native
             foreach (var folder in snapshot)
             {
                 try { if (Engine.ScanPending(folder)) changed.Add((string)folder["id"]); }
+                catch (OperationCanceledException) { break; }
                 catch (Exception error) { Engine.AddActivity("error", "文件核对未完成", error.Message, "warn"); }
             }
             if (changed.Count > 0 && Config.Peers.Count > 0 && JsonUtil.GetBool(Config.Settings["autoSync"], true)) ThreadPool.QueueUserWorkItem(delegate { Engine.SyncFolders(changed); });
@@ -413,7 +414,7 @@ namespace TwinSync.Native
                     var folder = Config.GetFolder(JsonUtil.GetString(body["folder"], ""));
                     if (folder == null) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件夹不存在"), 404);
                     if (!SharedWith(folder, peer) || JsonUtil.GetString(folder["mode"], "two-way") == "send-only") return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "没有写入权限"), 403);
-                    var incoming = JsonUtil.Obj("path", body["path"], "deleted", true, "rev", body["rev"], "origin", body["origin"], "mtimeMs", body["mtimeMs"], "size", 0, "hash", null);
+                    var incoming = JsonUtil.Obj("path", body["path"], "deleted", true, "rev", body["rev"], "origin", body["origin"], "mtimeMs", body["mtimeMs"], "size", 0, "hash", null, "baseHash", body["baseHash"]);
                     return HttpResponse.Json(Engine.AcceptIncomingDelete(peer, folder, JsonUtil.GetString(body["path"], ""), incoming), 200);
                 }
                 if (request.Path == "/peer/wake" && request.Method == "POST")
@@ -447,11 +448,12 @@ namespace TwinSync.Native
             var entry = Engine.IndexFor(folder).Get(request.Query.ContainsKey("path") ? request.Query["path"] : "");
             if (entry == null || EntryUtil.Deleted(entry)) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件不存在"), 404);
             var path = SafePath(JsonUtil.GetString(folder["path"], ""), EntryUtil.PathOf(entry));
-            if (!File.Exists(path)) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件不存在"), 404);
-            var guard = Engine.TransferGuard(peer, folder); guard();
+            var guard = Engine.TransferGuard(peer, folder, false, EntryUtil.PathOf(entry)); guard();
+            if (SyncEngine.Missing(path)) { Engine.RefreshMissing(folder, EntryUtil.PathOf(entry)); return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件已删除，请重新核对"), 404); }
+            guard = Engine.SourceGuard(folder, EntryUtil.PathOf(entry), guard);
             var expected = request.Query.ContainsKey("hash") ? request.Query["hash"] : "";
             if (!string.IsNullOrEmpty(expected) && !DeviceSecurity.Equal(expected, EntryUtil.HashOf(entry))) return HttpResponse.Json(JsonUtil.Obj("error", "源文件已变化，请重新核对。"), 409);
-            var input = File.OpenRead(path);
+            var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
             HttpResponse response;
             try
             {
@@ -553,15 +555,23 @@ namespace TwinSync.Native
             return response;
         }
 
+        private readonly object settingsGate = new object();
         private HttpResponse UpdateSettings(HttpRequest request)
         {
+            lock (settingsGate) return UpdateSettingsCore(request);
+        }
+        private HttpResponse UpdateSettingsCore(HttpRequest request)
+        {
+            var wasPaused = Engine.PauseRequested; var pauseChanged = false;
             try
             {
                 var body = JObject.Parse(request.ReadBodyString(1024 * 1024));
+                if (body["syncPaused"] != null && body["syncPaused"].Type != JTokenType.Boolean) throw new Exception("同步暂停设置必须为开启或关闭。");
                 if (body["openAtLogin"] != null && body["openAtLogin"].Type != JTokenType.Boolean) throw new Exception("开机启动设置必须为开启或关闭。");
                 if (body["conflictPolicy"] != null && !new[] { "copy", "newest" }.Contains(body["conflictPolicy"].ToString())) throw new Exception("冲突处理策略无效。");
                 foreach (var key in new[] { "maxVersionsPerFile", "versionRetentionDays" })
                     if (body[key] != null && (body[key].Type != JTokenType.Integer || JsonUtil.GetInt(body[key], 0) < 1 || JsonUtil.GetInt(body[key], int.MaxValue) > (key == "maxVersionsPerFile" ? 200 : 3650))) throw new Exception("历史版本保留设置超出范围。");
+                if (body["syncPaused"] != null) { pauseChanged = true; Engine.RequestPause(body["syncPaused"].Value<bool>()); }
                 lock (Engine.ConfigurationGate)
                 {
                     var previous = (JObject)Config.Settings.DeepClone();
@@ -585,12 +595,13 @@ namespace TwinSync.Native
                         throw;
                     }
                 }
+                if (pauseChanged) Engine.UpdatePauseStatus();
                 if (body["maxVersionsPerFile"] != null || body["versionRetentionDays"] != null)
                     try { Versions.Maintain(true); } catch (Exception error) { Engine.AddActivity("version", "版本清理未完成", error.Message, "warn"); }
                 discovery.SetEnabled(JsonUtil.GetBool(Config.Settings["discoveryEnabled"], true));
                 return HttpResponse.Json(JsonUtil.Obj("ok", true, "settings", Config.Settings), 200);
             }
-            catch (Exception error) { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
+            catch (Exception error) { if (pauseChanged) Engine.RequestPause(wasPaused); return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", error.Message), 400); }
         }
 
         public void ReconcileStartup()
@@ -742,11 +753,24 @@ namespace TwinSync.Native
             return HttpResponse.Json(JsonUtil.Obj("ok", true, "files", new JArray(files), "total", matches.Length, "offset", offset, "limit", limit), 200);
         }
 
+        private struct BrowseEntry
+        {
+            internal string Path, Hash, BaseHash;
+            internal long Size;
+            internal double Mtime;
+        }
         private HttpResponse BrowseFolder(HttpRequest request, JObject folder)
         {
             var directory = request.Query.ContainsKey("directory") ? request.Query["directory"].Replace('\\', '/').TrimEnd('/') : "";
             try { SafeFiles.UserPath(JsonUtil.GetString(folder["path"], ""), directory); }
             catch { return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "无效的目录路径"), 400); }
+            var root = (string)folder["path"];
+            if (!Directory.Exists(root)) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "同步根目录暂不可用"), 409);
+            var requestedDirectory = directory;
+            while (directory.Length > 0 && SyncEngine.Missing(SafeFiles.UserPath(root, directory)))
+            {
+                var slash = directory.LastIndexOf('/'); directory = slash < 0 ? "" : directory.Substring(0, slash);
+            }
             var prefix = directory.Length > 0 ? directory + "/" : "";
             var query = request.Query.ContainsKey("query") ? request.Query["query"].Trim() : "";
             var status = request.Query.ContainsKey("status") ? request.Query["status"] : "all";
@@ -756,16 +780,23 @@ namespace TwinSync.Native
             limit = Math.Max(1, Math.Min(100, limit)); offset = Math.Max(0, offset);
             var index = Engine.IndexFor(folder);
             if (index.LastScanAt == null) Engine.ScanFolder(folder, false);
-            var conflicts = new HashSet<string>(index.Conflicts.OfType<JObject>().Select(item => JsonUtil.GetString(item["path"], "")), StringComparer.OrdinalIgnoreCase);
+            BrowseEntry[] entries; HashSet<string> conflicts;
+            lock (Engine.ConfigurationGate)
+            {
+                entries = index.Entries.Values.Where(entry => !EntryUtil.Deleted(entry))
+                    .Select(entry => new BrowseEntry { Path = EntryUtil.PathOf(entry).Replace('\\', '/'), Hash = EntryUtil.HashOf(entry), BaseHash = EntryUtil.BaseHashOf(entry), Size = EntryUtil.SizeOf(entry), Mtime = EntryUtil.MtimeOf(entry) })
+                    .Where(entry => entry.Path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && entry.Path.Length > prefix.Length).ToArray();
+                conflicts = new HashSet<string>(index.Conflicts.OfType<JObject>().Select(item => JsonUtil.GetString(item["path"], "")), StringComparer.OrdinalIgnoreCase);
+            }
+            if (directory != requestedDirectory) offset = 0;
             var children = new Dictionary<string, JObject>(StringComparer.OrdinalIgnoreCase);
             long bytes = 0; int count = 0;
-            foreach (var entry in index.Entries.Values)
+            foreach (var entry in entries)
             {
-                var path = EntryUtil.PathOf(entry).Replace('\\', '/');
-                if (EntryUtil.Deleted(entry) || !path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || path.Length <= prefix.Length) continue;
+                var path = entry.Path;
                 if (query.Length > 0 && path.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
                 var conflicted = conflicts.Contains(path);
-                var pending = !string.Equals(EntryUtil.HashOf(entry), EntryUtil.BaseHashOf(entry), StringComparison.Ordinal);
+                var pending = !string.Equals(entry.Hash, entry.BaseHash, StringComparison.Ordinal);
                 if (status == "conflict" && !conflicted || status == "pending" && (!pending || conflicted) || status == "synced" && (pending || conflicted)) continue;
                 var remaining = path.Substring(prefix.Length);
                 var slash = remaining.IndexOf('/');
@@ -779,13 +810,21 @@ namespace TwinSync.Native
                     child = JsonUtil.Obj("name", name, "path", childPath, "type", isDirectory ? "directory" : "file", "size", 0L, "fileCount", 0, "pendingCount", 0, "conflictCount", 0, "mtimeMs", 0d);
                     children[childPath] = child;
                 }
-                var size = Math.Max(0, EntryUtil.SizeOf(entry));
+                var size = Math.Max(0, entry.Size);
                 child["size"] = JsonUtil.GetLong(child["size"], 0) + size;
                 child["fileCount"] = JsonUtil.GetInt(child["fileCount"], 0) + 1;
-                child["mtimeMs"] = Math.Max(child["mtimeMs"].Value<double>(), EntryUtil.MtimeOf(entry));
+                child["mtimeMs"] = Math.Max(child["mtimeMs"].Value<double>(), entry.Mtime);
                 if (conflicted) child["conflictCount"] = JsonUtil.GetInt(child["conflictCount"], 0) + 1;
                 else if (pending) child["pendingCount"] = JsonUtil.GetInt(child["pendingCount"], 0) + 1;
                 bytes += size; count++;
+            }
+            if (status == "all")
+            {
+                foreach (var childPath in Scanner.VisibleDirectories(folder, directory))
+                {
+                    if (children.ContainsKey(childPath) || query.Length > 0 && childPath.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    children[childPath] = JsonUtil.Obj("name", Path.GetFileName(childPath), "path", childPath, "type", "directory", "size", 0L, "fileCount", 0, "pendingCount", 0, "conflictCount", 0, "mtimeMs", 0d);
+                }
             }
             foreach (var child in children.Values) child["status"] = JsonUtil.GetInt(child["conflictCount"], 0) > 0 ? "conflict" : JsonUtil.GetInt(child["pendingCount"], 0) > 0 ? "pending" : "synced";
             var ordered = children.Values.OrderBy(child => child["type"].ToString() == "directory" ? 0 : 1).ThenBy(child => child["name"].ToString(), StringComparer.OrdinalIgnoreCase).ToArray();

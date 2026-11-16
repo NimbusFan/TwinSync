@@ -107,9 +107,11 @@ namespace TwinSync.Native
             lock (engine.ConfigurationGate)
             {
             if ((string)meta["binding"] != Digest(engine.TransferBinding(peer, folder))) throw new OperationCanceledException("同步授权已变更，请重新开始传输。");
-            var incoming = (JObject)meta["entry"]; var local = engine.IndexFor(folder).Get(EntryUtil.PathOf(incoming));
+            var incoming = (JObject)meta["entry"];
+            var check = engine.IncomingGuard(peer, folder, incoming, (string)meta["parent"]); check();
+            var local = engine.IndexFor(folder).Get(EntryUtil.PathOf(incoming));
             if (EntryUtil.HashOf(local) != (string)meta["localHash"] || EntryUtil.Deleted(local) != (bool)meta["localDeleted"]) throw new IOException("本地文件已变化，已保留本地修改。");
-            return engine.TransferGuard(peer, folder, true, EntryUtil.PathOf(incoming));
+            return check;
             }
         }
         private HttpResponse Start(JObject peer, JObject body)
@@ -120,6 +122,7 @@ namespace TwinSync.Native
             var path = EntryUtil.PathOf(supplied); var hash = EntryUtil.HashOf(supplied); var size = EntryUtil.SizeOf(supplied);
             if (string.IsNullOrEmpty(path) || path.Length > 4096 || size < 0 || !Regex.IsMatch(hash, "^[a-fA-F0-9]{64}$")) throw new IOException("文件信息无效。");
             var target = SafeFiles.UserPath((string)folder["path"], path);
+            if (engine.RejectDeletedParent(folder, supplied)) throw new IOException("接收目录已删除，已停止旧目录中的传输。");
             var binding = Digest(engine.TransferBinding(peer, folder));
             JObject before;
             lock (engine.ConfigurationGate) { var value = engine.IndexFor(folder).Get(path); before = value == null ? null : (JObject)value.DeepClone(); }
@@ -143,8 +146,8 @@ namespace TwinSync.Native
                         var tasks = Directory.GetFiles(directory, "*.json");
                         if (tasks.Length >= 16) { Reclaim(false, true); tasks = Directory.GetFiles(directory, "*.json"); }
                         if (tasks.Length >= 128 || tasks.Count(p => { try { return (string)JsonUtil.LoadObject(p)["peerId"] == (string)peer["id"]; } catch { return false; } }) >= 16) throw new TransferBusyException();
-                        var incoming = JsonUtil.Obj("path", path, "type", "file", "size", size, "hash", hash, "mtimeMs", EntryUtil.MtimeOf(supplied), "rev", EntryUtil.RevOf(supplied), "origin", EntryUtil.OriginOf(supplied), "deleted", false, "baseHash", "", "updatedAt", JsonUtil.NowIso());
-                        meta = JsonUtil.Obj("peerId", peer["id"], "folderId", folder["id"], "root", folder["path"], "binding", binding, "entry", incoming, "offset", 0, "localHash", EntryUtil.HashOf(local), "localDeleted", EntryUtil.Deleted(local), "targetHash", File.Exists(target) ? JsonUtil.Sha256File(target) : null, "updatedAt", JsonUtil.NowIso());
+                        var incoming = JsonUtil.Obj("path", path, "type", "file", "size", size, "hash", hash, "mtimeMs", EntryUtil.MtimeOf(supplied), "rev", EntryUtil.RevOf(supplied), "scanRev", Math.Max(EntryUtil.RevOf(supplied), JsonUtil.GetInt(supplied["scanRev"], 0)), "origin", EntryUtil.OriginOf(supplied), "deleted", false, "baseHash", "", "updatedAt", JsonUtil.NowIso());
+                        meta = JsonUtil.Obj("peerId", peer["id"], "folderId", folder["id"], "root", folder["path"], "binding", binding, "entry", incoming, "offset", 0, "localHash", EntryUtil.HashOf(local), "localDeleted", EntryUtil.Deleted(local), "parent", engine.ExistingParent(folder, path), "targetHash", File.Exists(target) ? JsonUtil.Sha256File(target) : null, "updatedAt", JsonUtil.NowIso());
                         using (var file = File.Create(part)) file.Flush(true);
                         JsonUtil.SaveAtomic(Meta(id), meta);
                     }

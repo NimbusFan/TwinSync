@@ -34,7 +34,7 @@ namespace TwinSync.Native
                 if (item.Paths.Count >= 4096) { item.Full = true; item.Paths.Clear(); } else item.Paths.Add(relative);
             }
         }
-        internal bool Scan(JObject folder, IndexStore index, ConfigStore config, bool manual, bool forceHash = false)
+        internal bool Scan(JObject folder, IndexStore index, ConfigStore config, bool manual, bool forceHash = false, Action check = null)
         {
             var id = (string)folder["id"]; Pending item; bool full; string[] paths;
             var signature = (string)folder["path"] + "\n" + folder["ignore"];
@@ -47,8 +47,9 @@ namespace TwinSync.Native
             if (!full && paths.Length == 0) return false;
             try
             {
-                if (full) { Scanner.Scan(folder, index, config, forceHash); FullScans++; }
-                else { Scanner.ScanPaths(folder, index, config, paths); PathScans++; }
+                Action<string> retry = delegate(string relative) { lock (gate) item.Paths.Add(relative); };
+                if (full) { Scanner.Scan(folder, index, config, forceHash, check, retry); FullScans++; }
+                else { Scanner.ScanPaths(folder, index, config, paths, check, retry); PathScans++; }
                 lock (gate) { item.Signature = signature; if (full) item.LastFull = DateTime.UtcNow; }
                 return true;
             }

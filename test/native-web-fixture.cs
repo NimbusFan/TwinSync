@@ -25,10 +25,20 @@ namespace TwinSync.Native
                 core.Engine.ScanFolder(folder, true); core.Config.Save();
                 core.Engine.AddActivity("sync", "可见的同步记录", "API 契约回归", "success"); core.Engine.AddActivity("file", "可见的文件记录", "API 契约回归", "info");
                 core.Start(); JsonUtil.SaveAtomic(Path.Combine(stage, "ready.json"), JsonUtil.Obj("port", port));
+                var churn = 0;
                 while (!File.Exists(Path.Combine(stage, "stop")))
                 {
                     var signal = Path.Combine(stage, "add-offer");
                     if (File.Exists(signal)) { File.Delete(signal); lock (core.Engine.ConfigurationGate) core.Engine.MergeFolders(new JArray(JsonUtil.Obj("id", JsonUtil.RandomId(), "name", "新收到的邀请")), (string)peer["id"]); }
+                    if (File.Exists(Path.Combine(stage, "churn")) && ++churn % 4 == 0)
+                    {
+                        var added = Path.Combine((string)folder["path"], "new-directory");
+                        Directory.CreateDirectory(added);
+                        File.WriteAllText(Path.Combine(added, "new-file.txt"), churn.ToString());
+                        core.Engine.ScanFolder(folder, true);
+                        lock (core.Engine.ConfigurationGate) core.Engine.SetStatus("syncing", "正在同步 " + churn, "new-directory/new-file.txt");
+                        core.Engine.AddActivity("file", "文件变更 " + churn, "", "info");
+                    }
                     Thread.Sleep(50);
                 }
                 return 0;

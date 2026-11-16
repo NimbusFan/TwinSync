@@ -20,6 +20,20 @@ namespace TwinSync.Native
         private readonly object gate = new object();
         private readonly Dictionary<string, long> permissions = new Dictionary<string, long>();
         private long pauseGeneration;
+        private volatile bool requestedPause;
+        private long interruptEpoch;
+        internal bool PauseRequested { get { return requestedPause; } }
+        internal void RequestPause(bool paused)
+        {
+            if (requestedPause == paused) return;
+            requestedPause = paused; Interlocked.Increment(ref interruptEpoch);
+        }
+        private void CheckScan() { if (requestedPause) throw new OperationCanceledException("同步已暂停。"); }
+        internal void UpdatePauseStatus()
+        {
+            lock (gate) if (requestedPause) { SetStatus("waiting", "同步已暂停", null); Status["transferActive"] = false; Status["speed"] = 0; }
+            else if (!syncing) SetStatus("idle", "同步已恢复", null);
+        }
         private bool syncing;
         private readonly string fingerprint;
         internal object ConfigurationGate { get { return gate; } }
@@ -46,13 +60,14 @@ namespace TwinSync.Native
             lock (gate)
             {
                 var peerKey = "peer:" + peer["id"]; var folderKey = "folder:" + folder["id"];
-                var peerGeneration = Generation(peerKey); var folderGeneration = Generation(folderKey); var pausedAt = pauseGeneration;
+                var peerGeneration = Generation(peerKey); var folderGeneration = Generation(folderKey); var pausedAt = pauseGeneration; var interruptedAt = Interlocked.Read(ref interruptEpoch);
                 var path = folder["path"].ToString(); var mode = JsonUtil.GetString(folder["mode"], "two-way");
                 var token = JsonUtil.GetString(peer["token"], "");
                 var before = relativePath == null ? null : IndexFor(folder).Get(relativePath);
                 var beforeHash = EntryUtil.HashOf(before); var beforeDeleted = EntryUtil.Deleted(before);
                 Action check = delegate
                 {
+                    if (requestedPause || Interlocked.Read(ref interruptEpoch) != interruptedAt) throw new OperationCanceledException("同步已暂停，本次任务已停止。");
                     lock (gate)
                     {
                         if (!object.ReferenceEquals(Config.GetPeer(peer["id"].ToString()), peer) || !object.ReferenceEquals(Config.GetFolder(folder["id"].ToString()), folder)
@@ -81,6 +96,7 @@ namespace TwinSync.Native
             {
                 lock (gate)
                 {
+                    if (requestedPause) return;
                     Status["transferActive"] = true; Status["transferDirection"] = direction;
                     Status["fileBytesDone"] = done; Status["fileBytesTotal"] = total;
                     if (initial < 0 || done < initial) { initial = done; clock.Restart(); }
@@ -91,7 +107,7 @@ namespace TwinSync.Native
 
         public SyncEngine(ConfigStore config, Dictionary<string, IndexStore> indexes, VersionStore versions, Func<string, bool> validatePairCode, string fingerprint)
         {
-            Config = config;
+            Config = config; requestedPause = JsonUtil.GetBool(config.Settings["syncPaused"], false);
             Indexes = indexes;
             Versions = versions;
             this.validatePairCode = validatePairCode;
@@ -127,7 +143,7 @@ namespace TwinSync.Native
             lock (gate)
             {
                 if (!JsonUtil.GetBool(folder["enabled"], true) || JsonUtil.GetBool(folder["paused"], false)) return;
-                Scans.Scan(folder, IndexFor(folder), Config, true, force);
+                Scans.Scan(folder, IndexFor(folder), Config, true, force, CheckScan);
             }
         }
 
@@ -136,7 +152,7 @@ namespace TwinSync.Native
             lock (gate)
             {
                 if (!JsonUtil.GetBool(folder["enabled"], true) || JsonUtil.GetBool(folder["paused"], false)) return false;
-                return Scans.Scan(folder, IndexFor(folder), Config, false);
+                return Scans.Scan(folder, IndexFor(folder), Config, false, false, CheckScan);
             }
         }
 
@@ -165,7 +181,7 @@ namespace TwinSync.Native
                          select new SyncPair { Peer = peer, Folder = folder, Check = TransferGuard(peer, folder) }).ToList();
                 Status["scope"] = JsonUtil.Obj("folderId", folderId, "peerId", peerId);
                 Status["lastAttemptAt"] = JsonUtil.NowIso();
-                if (JsonUtil.GetBool(Config.Settings["syncPaused"], false) || pairs.Count == 0)
+                if (requestedPause || JsonUtil.GetBool(Config.Settings["syncPaused"], false) || pairs.Count == 0)
                 {
                     var reason = JsonUtil.GetBool(Config.Settings["syncPaused"], false) ? "同步已暂停" : "没有可执行的同步任务，请检查文件夹、设备共享范围和暂停状态。";
                     SetStatus("waiting", reason, null); Status["lastResult"] = "skipped"; Status["error"] = null; Status["errors"] = new JArray();
@@ -200,7 +216,8 @@ namespace TwinSync.Native
                         lock (gate) { Status["currentFolder"] = folderId; Status["currentPeer"] = peerId; IndexFor(folder).Root["syncState"] = "syncing"; }
                         if (!pingResults.ContainsKey(peerId))
                         {
-                            try { new PeerClient(peer, Config.DeviceId).Ping(); pingResults[peerId] = null; lock (gate) online[peerId] = true; }
+                            try { new PeerClient(peer, Config.DeviceId, pair.Check).Ping(); pingResults[peerId] = null; lock (gate) online[peerId] = true; }
+                            catch (OperationCanceledException) { throw; }
                             catch (Exception error) { pingResults[peerId] = error.Message; lock (gate) online[peerId] = false; }
                         }
                         if (pingResults[peerId] != null) throw new Exception(pingResults[peerId]);
@@ -219,8 +236,8 @@ namespace TwinSync.Native
                     }
                     finally { lock (gate) Status["done"] = JsonUtil.GetInt(Status["done"], 0) + 1; }
                 }
-                var outcome = failed > 0 ? (successes > 0 || completedFiles > 0 ? "partial" : "failed") : conflicts > 0 ? "conflict" : skipped > 0 ? "skipped" : "success";
-                var message = outcome == "success" ? "所选内容同步完成" : outcome == "partial" ? "部分同步失败，请查看失败项目" : outcome == "failed" ? "同步失败，请检查设备连接和文件权限" : outcome == "conflict" ? "存在文件冲突，需要确认" : "同步未全部执行，请检查暂停状态";
+                var outcome = requestedPause ? "paused" : failed > 0 ? (successes > 0 || completedFiles > 0 ? "partial" : "failed") : conflicts > 0 ? "conflict" : skipped > 0 ? "skipped" : "success";
+                var message = outcome == "paused" ? "同步已暂停" : outcome == "success" ? "所选内容同步完成" : outcome == "partial" ? "部分同步失败，请查看失败项目" : outcome == "failed" ? "同步失败，请检查设备连接和文件权限" : outcome == "conflict" ? "存在文件冲突，需要确认" : "同步未全部执行，请检查暂停状态";
                 lock (gate)
                 {
                     foreach (var folder in pairs.Select(pair => pair.Folder).Distinct())
@@ -228,7 +245,8 @@ namespace TwinSync.Native
                         var index = IndexFor(folder); var id = folder["id"].ToString();
                         if (!object.ReferenceEquals(Config.GetFolder(id), folder)) continue;
                         var previousSuccess = index.LastSyncAt;
-                        index.Root["syncState"] = folderFailures.Contains(id) ? (conflicts > 0 && failed == 0 ? "conflict" : skipped > 0 && failed == 0 ? "waiting" : "error") : "synced";
+                        if (requestedPause) folderFailures.Add(id);
+                        index.Root["syncState"] = requestedPause ? "waiting" : folderFailures.Contains(id) ? (conflicts > 0 && failed == 0 ? "conflict" : skipped > 0 && failed == 0 ? "waiting" : "error") : "synced";
                         index.Root["lastError"] = folderFailures.Contains(id) ? message : null;
                         index.Root["lastResult"] = folderFailures.Contains(id) ? outcome : "success";
                         if (!folderFailures.Contains(id)) index.LastSyncAt = JsonUtil.NowIso();
@@ -240,7 +258,7 @@ namespace TwinSync.Native
                     Status["summary"] = JsonUtil.Obj("succeeded", successes, "failed", failed, "conflicts", conflicts, "skipped", skipped);
                     Status["error"] = errors.Count > 0 ? errors[0]["message"] : null;
                     if (outcome == "success") Status["lastSyncAt"] = JsonUtil.NowIso();
-                    SetStatus(outcome == "failed" ? "error" : outcome == "partial" ? "partial" : outcome == "conflict" ? "conflict" : outcome == "skipped" ? "waiting" : "idle", message, null);
+                    SetStatus(outcome == "failed" ? "error" : outcome == "partial" ? "partial" : outcome == "conflict" ? "conflict" : outcome == "skipped" || outcome == "paused" ? "waiting" : "idle", message, null);
                     AddActivity("sync", message, errors.Count > 0 ? errors[0]["message"].ToString() : "", outcome == "success" ? "success" : "warn");
                 }
             }
@@ -260,60 +278,206 @@ namespace TwinSync.Native
             if (errors.Count < 30) errors.Add(JsonUtil.Obj("folderId", folder["id"], "peerId", peer["id"], "path", path, "message", message));
         }
 
+        internal static bool Missing(string path)
+        {
+            try { File.GetAttributes(path); return false; }
+            catch (FileNotFoundException) { return true; }
+            catch (DirectoryNotFoundException) { return true; }
+        }
+
+        // Refresh the highest removed subtree once, rather than failing every stale file.
+        internal bool RefreshMissing(JObject folder, string relative)
+        {
+            lock (gate)
+            {
+                CheckScan();
+                var root = JsonUtil.GetString(folder["path"], "");
+                var target = SafePath(root, relative);
+                if (!Missing(target) && (File.GetAttributes(target) & FileAttributes.Directory) == 0) return false;
+                if (!Directory.Exists(root)) throw new IOException("同步根目录已不可用，未生成删除记录。");
+                var scope = relative.Replace('\\', '/');
+                for (var slash = scope.LastIndexOf('/'); slash > 0; slash = scope.LastIndexOf('/'))
+                {
+                    var parent = scope.Substring(0, slash);
+                    if (!Missing(SafePath(root, parent))) break;
+                    scope = parent;
+                }
+                return Scanner.ScanPaths(folder, IndexFor(folder), Config, new[] { scope }, CheckScan,
+                    path => Scans.Enqueue((string)folder["id"], root, SafePath(root, path))) > 0;
+            }
+        }
+
+        private static Dictionary<string, JObject> ManifestEntries(JObject manifest)
+        {
+            var array = manifest["entries"] as JArray;
+            if (array == null) throw new Exception("对方返回了无效的文件清单。");
+            var entries = new Dictionary<string, JObject>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in array.OfType<JObject>())
+            {
+                var path = EntryUtil.PathOf(entry).Replace('\\', '/');
+                if (!string.IsNullOrEmpty(path)) entries[path] = entry;
+            }
+            return entries;
+        }
+
         private PairResult Reconcile(JObject peer, JObject folder, JArray errors, Action check)
         {
             var result = new PairResult();
             var index = IndexFor(folder);
             var client = new PeerClient(peer, Config.DeviceId, check);
-            var manifest = client.Manifest(JsonUtil.GetString(folder["id"], ""));
-            var remote = new Dictionary<string, JObject>(StringComparer.OrdinalIgnoreCase);
-            var remoteArray = manifest["entries"] as JArray;
-            if (remoteArray == null) throw new Exception("对方返回了无效的文件清单。");
-            if (remoteArray != null)
-            {
-                foreach (var token in remoteArray.OfType<JObject>())
-                {
-                    var path = EntryUtil.PathOf(token).Replace('\\', '/');
-                    if (!string.IsNullOrEmpty(path)) remote[path] = token;
-                }
-            }
+            var remote = ManifestEntries(client.Manifest((string)folder["id"]));
             HashSet<string> union;
-            lock (gate) union = new HashSet<string>(index.Entries.Keys, StringComparer.OrdinalIgnoreCase);
+            lock (gate)
+            {
+                foreach (var entry in remote.Values) index.ObserveRev(EntryUtil.RevOf(entry));
+                union = new HashSet<string>(index.Entries.Keys, StringComparer.OrdinalIgnoreCase);
+            }
             foreach (var path in remote.Keys) union.Add(path);
             var mode = JsonUtil.GetString(folder["mode"], "two-way");
             foreach (var path in union)
             {
-                check();
-                JObject local;
-                lock (gate) { Status["currentFile"] = path; Status["transferActive"] = false; Status["speed"] = 0; local = index.Get(path); if (local != null) local = (JObject)local.DeepClone(); }
-                var remoteEntry = remote.ContainsKey(path) ? remote[path] : null;
-                var action = EntryUtil.Decide(local, remoteEntry, mode, JsonUtil.GetString(Config.Settings["conflictPolicy"], "copy"));
-                try
+                for (var attempt = 0; attempt < 2; attempt++)
                 {
-                    if (action == "pull") Pull(peer, folder, index, remoteEntry, local, check);
-                    else if (action == "push") Push(peer, folder, index, local, remoteEntry, check);
-                    else if (action == "same" && local != null && remoteEntry != null)
+                    check();
+                    JObject local = null;
+                    try
                     {
                         lock (gate)
                         {
-                            check();
-                            if (EntryUtil.HashOf(index.Get(path)) != EntryUtil.HashOf(local)) throw new IOException("文件索引已变化，请重新核对。");
-                            local["baseHash"] = EntryUtil.HashOf(remoteEntry);
-                            local["rev"] = Math.Max(EntryUtil.RevOf(local), EntryUtil.RevOf(remoteEntry));
-                            index.Upsert(local);
+                            Status["currentFile"] = path; Status["transferActive"] = false; Status["speed"] = 0;
+                            local = index.Get(path);
+                            if (local != null && !EntryUtil.Deleted(local)) RefreshMissing(folder, path);
+                            local = index.Get(path);
+                            if (local != null) local = (JObject)local.DeepClone();
                         }
+                        var remoteEntry = remote.ContainsKey(path) ? remote[path] : null;
+                        var action = EntryUtil.Decide(local, remoteEntry, mode, JsonUtil.GetString(Config.Settings["conflictPolicy"], "copy"));
+                        if (action == "pull") Pull(peer, folder, index, remoteEntry, local, check);
+                        else if (action == "push") Push(peer, folder, index, local, remoteEntry, check);
+                        else if (action == "same" && local != null && remoteEntry != null)
+                        {
+                            lock (gate)
+                            {
+                                check();
+                                if (EntryUtil.HashOf(index.Get(path)) != EntryUtil.HashOf(local) || EntryUtil.Deleted(index.Get(path)) != EntryUtil.Deleted(local)) throw new IOException("文件索引已变化，请重新核对。");
+                                local["baseHash"] = EntryUtil.HashOf(remoteEntry);
+                                local["rev"] = Math.Max(EntryUtil.RevOf(local), EntryUtil.RevOf(remoteEntry));
+                                index.Upsert(local);
+                            }
+                        }
+                        result.Completed++; break;
                     }
-                    result.Completed++;
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception error)
-                {
-                    result.Failures++;
-                    RecordSyncError(errors, folder, peer, path, error.Message);
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception error)
+                    {
+                        var changed = false;
+                        try
+                        {
+                            check();
+                            lock (gate)
+                            {
+                                RefreshMissing(folder, path);
+                                var current = index.Get(path);
+                                changed = EntryUtil.HashOf(current) != EntryUtil.HashOf(local) || EntryUtil.Deleted(current) != EntryUtil.Deleted(local);
+                            }
+                            var peerError = error as PeerRequestException;
+                            if (attempt == 0 && (changed || peerError != null && (peerError.Status == 404 || peerError.Status == 409)))
+                            {
+                                remote = ManifestEntries(client.Manifest((string)folder["id"]));
+                                lock (gate) foreach (var entry in remote.Values) index.ObserveRev(EntryUtil.RevOf(entry));
+                                continue;
+                            }
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch { }
+                        result.Failures++;
+                        RecordSyncError(errors, folder, peer, path, error.Message); break;
+                    }
                 }
             }
             lock (gate) { check(); result.Conflicts = index.ConflictCount; index.Save(); }
             return result;
+        }
+
+        internal Action SourceGuard(JObject folder, string relative, Action check)
+        {
+            var source = SafePath((string)folder["path"], relative);
+            return delegate
+            {
+                check();
+                lock (gate)
+                {
+                    if (!Missing(source)) return;
+                    RefreshMissing(folder, relative);
+                    throw new FileNotFoundException("源文件已删除，已重新核对对应目录。", source);
+                }
+            };
+        }
+
+        internal string ExistingParent(JObject folder, string path)
+        {
+            var root = ((string)folder["path"]).TrimEnd('\\', '/');
+            if (!Directory.Exists(root)) throw new IOException("同步根目录已不可用。");
+            var ancestor = Path.GetDirectoryName(SafePath(root, path));
+            while (Missing(ancestor) && !string.Equals(ancestor, root, StringComparison.OrdinalIgnoreCase)) ancestor = Path.GetDirectoryName(ancestor);
+            return ancestor.Substring(root.Length).TrimStart('\\', '/').Replace('\\', '/');
+        }
+
+        internal Action IncomingGuard(JObject peer, JObject folder, JObject remote, string parent = null)
+        {
+            var root = (string)folder["path"]; var path = EntryUtil.PathOf(remote);
+            var ancestor = SafePath(root, parent ?? ExistingParent(folder, path));
+            var entryCheck = TransferGuard(peer, folder, true, path);
+            return delegate
+            {
+                try { entryCheck(); }
+                catch (IOException) { if (!Missing(ancestor)) throw; }
+                lock (gate)
+                {
+                    if (!Missing(ancestor)) return;
+                    if (!Directory.Exists(root)) throw new IOException("同步根目录已不可用，未提交文件。");
+                    // Retain a parent deletion observed after this transfer began.
+                    var index = IndexFor(folder); index.ObserveRev(Math.Max(EntryUtil.RevOf(remote), JsonUtil.GetInt(remote["scanRev"], 0)));
+                    var deleted = (JObject)remote.DeepClone();
+                    deleted["deleted"] = true; deleted["hash"] = null; deleted["size"] = 0;
+                    deleted["rev"] = index.NextRev(); deleted["origin"] = Config.DeviceId;
+                    deleted["baseHash"] = EntryUtil.HashOf(remote); deleted["updatedAt"] = JsonUtil.NowIso();
+                    index.Upsert(deleted);
+                    var ancestorPath = ancestor.Substring(root.TrimEnd('\\', '/').Length).TrimStart('\\', '/').Replace('\\', '/');
+                    if (ancestorPath.Length > 0)
+                    {
+                        var directories = index.Root["deletedDirectories"] as JObject;
+                        if (directories == null) index.Root["deletedDirectories"] = directories = new JObject();
+                        directories[ancestorPath] = JsonUtil.Obj("rev", EntryUtil.RevOf(deleted), "origin", Config.DeviceId);
+                    }
+                    index.Save();
+                    throw new IOException("接收目录已删除，已停止旧文件任务。");
+                }
+            };
+        }
+
+        internal bool RejectDeletedParent(JObject folder, JObject incoming)
+        {
+            lock (gate)
+            {
+                var index = IndexFor(folder); var directories = index.Root["deletedDirectories"] as JObject;
+                if (directories == null) return false;
+                var path = EntryUtil.PathOf(incoming);
+                foreach (var property in directories.Properties().ToList())
+                {
+                    if (!path.StartsWith(property.Name + "/", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!Missing(SafePath((string)folder["path"], property.Name))) { property.Remove(); continue; }
+                    var deletion = property.Value as JObject;
+                    if (deletion == null || EntryUtil.Compare(deletion, incoming) < 0) continue;
+                    var entry = (JObject)incoming.DeepClone();
+                    entry["deleted"] = true; entry["hash"] = null; entry["size"] = 0;
+                    entry["baseHash"] = EntryUtil.HashOf(incoming); entry["rev"] = EntryUtil.RevOf(deletion);
+                    entry["origin"] = EntryUtil.OriginOf(deletion); entry["updatedAt"] = JsonUtil.NowIso();
+                    index.Upsert(entry); index.ObserveRev(EntryUtil.RevOf(entry)); index.Save();
+                    return true;
+                }
+                return false;
+            }
         }
 
         private void Pull(JObject peer, JObject folder, IndexStore index, JObject remote, JObject local, Action check)
@@ -335,6 +499,9 @@ namespace TwinSync.Native
                 }
                 return;
             }
+            if (RejectDeletedParent(folder, remote)) throw new IOException("接收目录已删除，已停止旧目录中的传输。");
+            var pairCheck = check; var incomingCheck = IncomingGuard(peer, folder, remote);
+            check = delegate { pairCheck(); incomingCheck(); };
             var downloaded = new PeerClient(peer, Config.DeviceId, check).Download(JsonUtil.GetString(folder["id"], ""), remote, target, TransferProgress("download"), (string)folder["path"]);
             var temp = JsonUtil.GetString(downloaded["temp"], "");
             try
@@ -356,6 +523,7 @@ namespace TwinSync.Native
 
         private void Push(JObject peer, JObject folder, IndexStore index, JObject local, JObject remote, Action check)
         {
+            if (!EntryUtil.Deleted(local)) check = SourceGuard(folder, EntryUtil.PathOf(local), check);
             var client = new PeerClient(peer, Config.DeviceId, check);
             if (EntryUtil.Deleted(local))
             {
@@ -369,7 +537,9 @@ namespace TwinSync.Native
             }
             var source = SafePath(JsonUtil.GetString(folder["path"], ""), EntryUtil.PathOf(local));
             if (!File.Exists(source)) throw new FileNotFoundException("待发送的文件已不存在，请重新扫描。", source);
-            var response = client.Upload(JsonUtil.GetString(folder["id"], ""), local, source, false, TransferProgress("upload"));
+            JObject outgoing;
+            lock (gate) { outgoing = (JObject)local.DeepClone(); outgoing["scanRev"] = JsonUtil.GetInt(index.Root["lamport"], EntryUtil.RevOf(local)); }
+            var response = client.Upload(JsonUtil.GetString(folder["id"], ""), outgoing, source, false, TransferProgress("upload"));
             if (JsonUtil.GetBool(response["conflict"], false)) throw new Exception("对方保留了不同版本，请先处理文件冲突。");
             if (JsonUtil.GetBool(response["superseded"], false)) throw new Exception("对方文件较新，未覆盖；请重新核对以接收新版本。");
             lock (gate)
@@ -486,7 +656,7 @@ namespace TwinSync.Native
         private JObject AcceptIncomingDeleteCore(JObject peer, JObject folder, string relPath, JObject incoming)
         {
             SafeFiles.Join(JsonUtil.GetString(folder["path"], ""), relPath);
-            var index = IndexFor(folder);
+            var index = IndexFor(folder); index.ObserveRev(EntryUtil.RevOf(incoming));
             var local = index.Get(relPath);
             if (local == null)
             {
@@ -507,7 +677,7 @@ namespace TwinSync.Native
                 index.Save();
                 return JsonUtil.Obj("ok", true, "conflict", true);
             }
-            if (EntryUtil.HashOf(local) != EntryUtil.BaseHashOf(local))
+            if (EntryUtil.HashOf(local) != EntryUtil.BaseHashOf(local) && EntryUtil.HashOf(local) != EntryUtil.BaseHashOf(incoming))
             {
                 index.AddConflict(JsonUtil.Obj("path", relPath, "conflictPath", null, "kind", "peer-delete", "peerId", JsonUtil.GetString(peer["id"], ""), "peerName", JsonUtil.GetString(peer["name"], ""), "localHash", EntryUtil.HashOf(local), "remoteHash", null, "message", "对方删除了文件，但本机有修改", "createdAt", JsonUtil.NowIso()));
                 index.Save();

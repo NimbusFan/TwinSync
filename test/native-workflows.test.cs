@@ -136,7 +136,7 @@ namespace TwinSync.Native
                 b = new CoreService(args[1], Path.Combine(root, "home-b"), Port(), null, enabled => { });
                 c = new CoreService(args[1], Path.Combine(root, "home-c"), Port(), null, enabled => { });
                 foreach (var core in new[] { a, b, c }) { core.Config.Settings["autoSync"] = false; core.Config.Settings["discoveryEnabled"] = false; core.Config.Device["port"] = core.Port; core.Start(); }
-                Verify(a, b, c, root); StartupApi(a, registrations, value => failStartup = value); Improvements(a, b, root, args[1]); Reliability(a, b, root);
+                Verify(a, b, c, root); StartupApi(a, registrations, value => failStartup = value); Improvements(a, b, root, args[1]); DirectoryRaceCases(a, b, root); Reliability(a, b, root);
                 Console.WriteLine("Workflow regressions passed: " + checks + " checks (scoped sync, failures, migration, startup, atomic files, conflicts, authorization, versions, byte progress)."); return 0;
             }
             catch (Exception error) { Console.Error.WriteLine(error); return 1; }

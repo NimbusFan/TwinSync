@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -52,6 +52,38 @@ namespace TwinSync.Native
             request.Headers["x-twinsync-device"] = localDeviceId;
             return request;
         }
+        // Abort blocked socket operations as well as checking between chunks.
+        private T WithCancellation<T>(HttpWebRequest request, Func<T> action)
+        {
+            if (check == null) return action();
+            check();
+            Exception interrupted = null; var checking = 0; var finished = 0;
+            using (var timer = new System.Threading.Timer(delegate
+            {
+                if (System.Threading.Interlocked.CompareExchange(ref checking, 1, 0) != 0) return;
+                try
+                {
+                    if (System.Threading.Interlocked.CompareExchange(ref finished, 0, 0) != 0) return;
+                    try { check(); }
+                    catch (Exception error)
+                    {
+                        System.Threading.Interlocked.CompareExchange(ref interrupted, error, null);
+                        request.Abort();
+                    }
+                }
+                finally { System.Threading.Interlocked.Exchange(ref checking, 0); }
+            }, null, 100, 100))
+            {
+                try { var value = action(); check(); return value; }
+                catch
+                {
+                    var cancellation = System.Threading.Interlocked.CompareExchange(ref interrupted, null, null);
+                    if (cancellation != null) throw cancellation;
+                    check(); throw;
+                }
+                finally { System.Threading.Interlocked.Exchange(ref finished, 1); }
+            }
+        }
         private static HttpWebResponse Response(HttpWebRequest request)
         {
             try { return (HttpWebResponse)request.GetResponse(); }
@@ -103,8 +135,7 @@ namespace TwinSync.Native
         public JObject RequestJson(string route, HttpMethod method, JToken body, int timeoutMs)
         {
             var request = Request(method.Method, route, timeoutMs);
-            if (body != null) WriteJson(request, body);
-            return ReadJson(request);
+            return WithCancellation(request, delegate { if (body != null) WriteJson(request, body); return ReadJson(request); });
         }
         public JObject Ping() { return RequestJson("/peer/ping", HttpMethod.Get, null, 6000); }
         public JObject Manifest(string folderId) { return RequestJson("/peer/manifest?folder=" + Uri.EscapeDataString(folderId), HttpMethod.Get, null, 45000); }
@@ -112,7 +143,7 @@ namespace TwinSync.Native
         public JObject Ack(string folderId, JArray entries) { return RequestJson("/peer/ack", HttpMethod.Post, JsonUtil.Obj("folder", folderId, "entries", entries), 15000); }
         public JObject Delete(string folderId, string relPath, JObject entry)
         {
-            return RequestJson("/peer/delete", HttpMethod.Post, JsonUtil.Obj("folder", folderId, "path", relPath, "rev", EntryUtil.RevOf(entry), "origin", EntryUtil.OriginOf(entry), "mtimeMs", (long)EntryUtil.MtimeOf(entry)), 30000);
+            return RequestJson("/peer/delete", HttpMethod.Post, JsonUtil.Obj("folder", folderId, "path", relPath, "rev", EntryUtil.RevOf(entry), "origin", EntryUtil.OriginOf(entry), "mtimeMs", (long)EntryUtil.MtimeOf(entry), "baseHash", EntryUtil.BaseHashOf(entry)), 30000);
         }
         public JObject FolderShare(JObject folder, bool shared)
         {
@@ -156,6 +187,8 @@ namespace TwinSync.Native
                         var request = Request("GET", route, 30000);
                         var end = Math.Min(total, offset + ResumableTransfers.ChunkSize) - 1; request.AddRange(offset, end);
                         if (verifyPrefix) { output.Position = 0; request.Headers["x-twinsync-prefix"] = ResumableTransfers.PrefixHash(output, offset); }
+                        WithCancellation(request, delegate
+                        {
                         using (var response = Response(request))
                         using (var input = response.GetResponseStream())
                         {
@@ -172,6 +205,8 @@ namespace TwinSync.Native
                                 if (progress != null) progress(output.Length, total);
                             }
                         }
+                        return true;
+                        });
                         verifyPrefix = false; attempt = 0;
                     }
                     catch (Exception error)
@@ -220,8 +255,11 @@ namespace TwinSync.Native
                     string hash; using (var sha = System.Security.Cryptography.SHA256.Create()) hash = ResumableTransfers.Hex(sha.ComputeHash(buffer, 0, count));
                     var request = Request("PUT", "/peer/transfers/" + id + "?offset=" + offset + "&hash=" + hash, 30000);
                     request.AllowWriteStreamBuffering = false; request.ContentType = "application/octet-stream"; request.ContentLength = count;
-                    using (var output = request.GetRequestStream()) for (var i = 0; i < count; i += 65536) { if (check != null) check(); output.Write(buffer, i, Math.Min(65536, count - i)); if (progress != null) progress(offset + Math.Min(i + 65536, count), total); }
-                    var ack = ReadJson(request); if ((long)ack["offset"] != offset + count) throw new IOException("分块确认位置无效。"); offset += count;
+                    var ack = WithCancellation(request, delegate
+                    {
+                        using (var output = request.GetRequestStream()) for (var i = 0; i < count; i += 65536) { if (check != null) check(); output.Write(buffer, i, Math.Min(65536, count - i)); if (progress != null) progress(offset + Math.Min(i + 65536, count), total); }
+                        return ReadJson(request);
+                    }); if ((long)ack["offset"] != offset + count) throw new IOException("分块确认位置无效。"); offset += count;
                 }
                 if (check != null) check();
                 return RequestJson("/peer/transfers/" + id + "/commit", HttpMethod.Post, new JObject(), 600000);
@@ -234,9 +272,12 @@ namespace TwinSync.Native
             request.AllowWriteStreamBuffering = false;
             request.ContentType = "application/octet-stream";
             request.ContentLength = new FileInfo(source).Length;
-            using (var input = File.OpenRead(source))
-            using (var output = request.GetRequestStream()) Copy(input, output, request.ContentLength, progress);
-            var response = ReadJson(request);
+            var response = WithCancellation(request, delegate
+            {
+                using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
+                using (var output = request.GetRequestStream()) Copy(input, output, request.ContentLength, progress);
+                return ReadJson(request);
+            });
             if (check != null) check();
             return response;
         }
