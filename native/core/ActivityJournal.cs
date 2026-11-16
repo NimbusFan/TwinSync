@@ -46,13 +46,26 @@ namespace TwinSync.Native
         }
         private JObject Clean(JObject item)
         {
-            return JsonUtil.Obj("id", JsonUtil.GetString(item["id"], JsonUtil.RandomId()), "at", Redact((string)item["at"]), "type", Redact((string)item["type"]), "title", Redact((string)item["title"]), "detail", Redact((string)item["detail"]), "level", Redact((string)item["level"]));
+            var result = JsonUtil.Obj("id", JsonUtil.GetString(item["id"], JsonUtil.RandomId()), "at", Redact((string)item["at"]), "type", Redact((string)item["type"]), "title", Redact((string)item["title"]), "detail", Redact((string)item["detail"]), "level", Redact((string)item["level"]));
+            var data = item["data"] as JObject;
+            if (data != null)
+            {
+                var clean = new JObject();
+                foreach (var key in new[] { "actor", "folder", "path", "kind", "action", "direction", "scope", "files", "bytes", "durationMs", "deleted", "checked", "uploaded", "downloaded", "failed" })
+                {
+                    var value = data[key]; if (value == null) continue;
+                    if (value.Type == JTokenType.String) clean[key] = Redact((string)value);
+                    else if (value.Type == JTokenType.Integer || value.Type == JTokenType.Float) clean[key] = Math.Max(0, value.Value<double>());
+                }
+                result["data"] = clean;
+            }
+            return result;
         }
-        internal JObject Append(string type, string title, string detail, string level)
+        internal JObject Append(string type, string title, string detail, string level, JObject data = null)
         {
             lock (gate)
             {
-                var item = Clean(JsonUtil.Obj("id", JsonUtil.RandomId(), "at", JsonUtil.NowIso(), "type", type, "title", title, "detail", detail, "level", level));
+                var item = Clean(JsonUtil.Obj("id", JsonUtil.RandomId(), "at", JsonUtil.NowIso(), "type", type, "title", title, "detail", detail, "level", level, "data", data));
                 recent.Insert(0, item); while (recent.Count > 300) recent.RemoveAt(300);
                 try
                 {
@@ -76,6 +89,7 @@ namespace TwinSync.Native
             var events = Read(300);
             foreach (var item in events.OfType<JObject>())
             {
+                if (item["data"] != null) { item.Remove("data"); item["title"] = (string)item["type"] == "file" ? "文件变更" : (string)item["type"] == "device" ? "设备动态" : "同步记录"; }
                 foreach (var prop in new[] { "title", "detail" })
                 {
                     var text = Redact((string)item[prop]);

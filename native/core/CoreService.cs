@@ -179,7 +179,7 @@ namespace TwinSync.Native
             }
             if (changed.Count > 0 && Config.Peers.Count > 0 && JsonUtil.GetBool(Config.Settings["autoSync"], true)) ThreadPool.QueueUserWorkItem(delegate { Engine.SyncFolders(changed); });
             }
-            finally { Interlocked.Exchange(ref watchActive, 0); }
+            finally { Engine.FlushActivity(); Interlocked.Exchange(ref watchActive, 0); }
         }
 
         private HttpResponse Route(HttpRequest request)
@@ -270,7 +270,7 @@ namespace TwinSync.Native
             var versionRestore = Regex.Match(request.Path, "^/api/versions/([0-9a-fA-F-]{36})/restore$");
             if (versionRestore.Success && request.Method == "POST") return RestoreVersion(versionRestore.Groups[1].Value);
             if (request.Path == "/api/versions/restore-batch" && request.Method == "POST") return RestoreBatch(request);
-            if (request.Path == "/api/activity" && request.Method == "GET") return HttpResponse.Json(JsonUtil.Obj("ok", true, "activity", Engine.Journal.Read(request.Query.ContainsKey("limit") ? JsonUtil.GetInt(request.Query["limit"], 300) : 300)), 200);
+            if (request.Path == "/api/activity" && request.Method == "GET") { Engine.FlushActivity(); return HttpResponse.Json(JsonUtil.Obj("ok", true, "activity", Engine.Journal.Read(request.Query.ContainsKey("limit") ? JsonUtil.GetInt(request.Query["limit"], 300) : 300)), 200); }
             if (request.Path == "/api/diagnostics/export" && request.Method == "GET")
             {
                 HttpResponse response;
@@ -396,6 +396,15 @@ namespace TwinSync.Native
                     if (!SharedWith(folder, peer)) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "未共享"), 403);
                     return HttpResponse.Json(JsonUtil.Obj("ok", true, "folder", JsonUtil.Obj("id", folder["id"], "name", folder["name"]), "entries", Engine.Manifest(folder, peer)), 200);
                 }
+                if (request.Path == "/peer/activity-finish" && request.Method == "POST")
+                {
+                    var body = JObject.Parse(request.ReadBodyString(8192)); var folder = Config.GetFolder((string)body["folder"]);
+                    if (!SharedWith(folder, peer)) return HttpResponse.Json(JsonUtil.Obj("error", "未共享"), 403);
+                    var metrics = body["metrics"] as JObject; if (metrics == null) return HttpResponse.Json(JsonUtil.Obj("error", "缺少同步统计"), 400);
+                    Engine.TransferGuard(peer, folder)();
+                    Engine.ReceiveSyncActivity(peer, folder, metrics, JsonUtil.GetBool(body["succeeded"], false));
+                    return HttpResponse.Json(JsonUtil.Obj("ok", true), 200);
+                }
                 if (request.Path == "/peer/file" && request.Method == "GET") return PeerDownload(peer, request);
                 if (request.Path == "/peer/file" && request.Method == "PUT") return PeerUpload(peer, request);
                 if (request.Path.StartsWith("/peer/transfers", StringComparison.Ordinal)) return transfers.Route(peer, request);
@@ -414,7 +423,7 @@ namespace TwinSync.Native
                     var folder = Config.GetFolder(JsonUtil.GetString(body["folder"], ""));
                     if (folder == null) return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "文件夹不存在"), 404);
                     if (!SharedWith(folder, peer) || JsonUtil.GetString(folder["mode"], "two-way") == "send-only") return HttpResponse.Json(JsonUtil.Obj("ok", false, "error", "没有写入权限"), 403);
-                    var incoming = JsonUtil.Obj("path", body["path"], "deleted", true, "rev", body["rev"], "origin", body["origin"], "mtimeMs", body["mtimeMs"], "size", 0, "hash", null, "baseHash", body["baseHash"]);
+                    var incoming = JsonUtil.Obj("path", body["path"], "deleted", true, "rev", body["rev"], "origin", body["origin"], "mtimeMs", body["mtimeMs"], "size", 0, "hash", null, "baseHash", body["baseHash"], "changeRoot", body["changeRoot"]);
                     return HttpResponse.Json(Engine.AcceptIncomingDelete(peer, folder, JsonUtil.GetString(body["path"], ""), incoming), 200);
                 }
                 if (request.Path == "/peer/wake" && request.Method == "POST")
@@ -980,9 +989,10 @@ namespace TwinSync.Native
         {
             try
             {
-                var body = JObject.Parse(request.ReadBodyString(1024 * 1024));
+                var body = JObject.Parse(request.ReadBodyString(1024 * 1024)); JObject previousPeer = null;
                 Engine.ChangeConfiguration(delegate
                 {
+                    previousPeer = (JObject)peer.DeepClone();
                     var permissionsChanged = body.Properties().Any(property => new[] { "host", "port", "paused" }.Contains(property.Name) && !JToken.DeepEquals(peer[property.Name], property.Value));
                     foreach (var property in body.Properties())
                     {
@@ -991,6 +1001,7 @@ namespace TwinSync.Native
                     Config.Save();
                     if (permissionsChanged) Engine.InvalidatePeer(peer);
                 }, false);
+                if (body.Properties().Any(property => new[] { "name", "host", "port", "autoSync", "paused" }.Contains(property.Name) && !JToken.DeepEquals(previousPeer[property.Name], peer[property.Name]))) Engine.AddActivity("device", JsonUtil.GetString(peer["name"], "未命名设备") + " 的设置已更新", string.Join("、", body.Properties().Where(property => new[] { "name", "host", "port", "autoSync", "paused" }.Contains(property.Name) && !JToken.DeepEquals(previousPeer[property.Name], peer[property.Name])).Select(property => property.Name == "name" ? "设备名称：" + previousPeer["name"] + " → " + peer["name"] : property.Name == "paused" ? (JsonUtil.GetBool(peer["paused"], false) ? "暂停设备同步" : "恢复设备同步") : property.Name == "autoSync" ? (JsonUtil.GetBool(peer["autoSync"], true) ? "启用自动同步" : "关闭自动同步") : "连接地址").Distinct()), "info", JsonUtil.Obj("actor", peer["name"], "action", "settings"));
                 var publicPeer = (JObject)peer.DeepClone(); publicPeer.Remove("token");
                 return HttpResponse.Json(JsonUtil.Obj("ok", true, "peer", publicPeer), 200);
             }
@@ -1001,6 +1012,7 @@ namespace TwinSync.Native
         {
             Engine.ChangeConfiguration(delegate
             {
+                Engine.AddActivity("device", JsonUtil.GetString(peer["name"], "未命名设备") + " 已解除配对", "已撤销该设备的文件夹访问权限", "info", JsonUtil.Obj("actor", peer["name"], "action", "removed"));
                 Engine.InvalidatePeer(peer);
                 Config.Peers.Remove(peer);
                 foreach (var folder in Config.Folders.OfType<JObject>())
@@ -1120,6 +1132,7 @@ namespace TwinSync.Native
 
         private object BuildStateSnapshot()
         {
+            Engine.FlushActivity();
             var peers = new JArray();
             foreach (var peer in Config.Peers.OfType<JObject>())
             {

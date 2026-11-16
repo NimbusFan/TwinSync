@@ -112,13 +112,14 @@ namespace TwinSync.Native
             return target;
         }
 
-        public static IEnumerable<string> Enumerate(string root)
+        public static IEnumerable<string> Enumerate(string root, Action<string> visitDirectory = null)
         {
             var pending = new Stack<string>();
             pending.Push(root);
             while (pending.Count > 0)
             {
                 var directory = pending.Pop();
+                if (visitDirectory != null) visitDirectory(directory);
                 string[] children;
                 try { children = Directory.GetFileSystemEntries(directory); }
                 catch (DirectoryNotFoundException) { continue; }

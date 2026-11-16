@@ -18,6 +18,7 @@ namespace TwinSync.Native
         private readonly object gate = new object();
         private readonly Dictionary<string, Pending> pending = new Dictionary<string, Pending>();
         internal long FullScans, PathScans;
+        internal Action<JObject, JArray> Changed;
         private Pending Get(string id) { Pending item; if (!pending.TryGetValue(id, out item)) pending[id] = item = new Pending(); return item; }
         internal void Watching(string id, bool value) { lock (gate) Get(id).Watching = value; }
         internal void Enqueue(string id, string root, string path)
@@ -48,8 +49,8 @@ namespace TwinSync.Native
             try
             {
                 Action<string> retry = delegate(string relative) { lock (gate) item.Paths.Add(relative); };
-                if (full) { Scanner.Scan(folder, index, config, forceHash, check, retry); FullScans++; }
-                else { Scanner.ScanPaths(folder, index, config, paths, check, retry); PathScans++; }
+                if (full) { Scanner.Scan(folder, index, config, forceHash, check, retry, changes => { if (Changed != null) Changed(folder, changes); }); FullScans++; }
+                else { Scanner.ScanPaths(folder, index, config, paths, check, retry, changes => { if (Changed != null) Changed(folder, changes); }); PathScans++; }
                 lock (gate) { item.Signature = signature; if (full) item.LastFull = DateTime.UtcNow; }
                 return true;
             }

@@ -23,7 +23,7 @@ namespace TwinSync.Native
                 Directory.CreateDirectory((string)folder["path"]); File.WriteAllText(Path.Combine((string)folder["path"], "example.txt"), "test data"); core.Config.Folders.Add(folder);
                 core.Engine.MergeFolders(new JArray(JsonUtil.Obj("id", JsonUtil.RandomId(), "name", "待确认邀请")), (string)peer["id"]);
                 core.Engine.ScanFolder(folder, true); core.Config.Save();
-                core.Engine.AddActivity("sync", "可见的同步记录", "API 契约回归", "success"); core.Engine.AddActivity("file", "可见的文件记录", "API 契约回归", "info");
+                core.Engine.AddActivity("sync", "可见的同步记录", "资料 ↔ 对方测试设备", "success", JsonUtil.Obj("files", 3, "bytes", 8192, "durationMs", 2450, "uploaded", 2, "downloaded", 1, "checked", 5, "deleted", 1)); core.Engine.AddActivity("file", "可见的文件记录", "API 契约回归", "info");
                 core.Start(); JsonUtil.SaveAtomic(Path.Combine(stage, "ready.json"), JsonUtil.Obj("port", port));
                 var churn = 0;
                 while (!File.Exists(Path.Combine(stage, "stop")))

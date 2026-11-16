@@ -143,7 +143,7 @@ namespace TwinSync.Native
         public JObject Ack(string folderId, JArray entries) { return RequestJson("/peer/ack", HttpMethod.Post, JsonUtil.Obj("folder", folderId, "entries", entries), 15000); }
         public JObject Delete(string folderId, string relPath, JObject entry)
         {
-            return RequestJson("/peer/delete", HttpMethod.Post, JsonUtil.Obj("folder", folderId, "path", relPath, "rev", EntryUtil.RevOf(entry), "origin", EntryUtil.OriginOf(entry), "mtimeMs", (long)EntryUtil.MtimeOf(entry), "baseHash", EntryUtil.BaseHashOf(entry)), 30000);
+            return RequestJson("/peer/delete", HttpMethod.Post, JsonUtil.Obj("folder", folderId, "path", relPath, "rev", EntryUtil.RevOf(entry), "origin", EntryUtil.OriginOf(entry), "mtimeMs", (long)EntryUtil.MtimeOf(entry), "baseHash", EntryUtil.BaseHashOf(entry), "changeRoot", entry["changeRoot"]), 30000);
         }
         public JObject FolderShare(JObject folder, bool shared)
         {

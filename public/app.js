@@ -1101,7 +1101,7 @@ function renderHistoryView() {
     </div>
     <div class="history-summary">
       <div class="summary-chip"><span>记录总数</span><strong data-history-total>${fmtNumber(items.length)}</strong></div>
-      <div class="summary-chip"><span>同步完成</span><strong data-history-sync>${fmtNumber(syncCount)}</strong></div>
+      <div class="summary-chip"><span>同步记录</span><strong data-history-sync>${fmtNumber(syncCount)}</strong></div>
       <div class="summary-chip"><span>冲突处理</span><strong data-history-conflict>${fmtNumber(conflictCount)}</strong></div>
     </div>
     <div class="toolbar">
@@ -1110,10 +1110,31 @@ function renderHistoryView() {
     <div class="panel" style="padding-top:0"><div id="history-timeline">${historyTimelineHtml()}</div></div>`;
 }
 
+function activityStatsHtml(item) {
+  const data = item.data;
+  if (!data) return '';
+  const parts = [];
+  if (item.type === 'sync') {
+    const seconds = Math.max(0, Number(data.durationMs) || 0) / 1000;
+    const duration = seconds < 1 ? '<1 秒' : seconds < 60 ? `${seconds.toFixed(1)} 秒` : `${Math.floor(Math.round(seconds) / 60)} 分 ${Math.round(seconds) % 60} 秒`;
+    parts.push(`同步 ${fmtNumber(data.files || 0)} 个文件`, fmtBytes(data.bytes || 0), `耗时 ${duration}`);
+    parts.push(`发送 ${fmtNumber(data.uploaded || 0)} · 接收 ${fmtNumber(data.downloaded || 0)}`);
+    if (data.deleted) parts.push(`删除 ${fmtNumber(data.deleted)} 个文件`);
+    if (data.failed) parts.push(`未完成 ${fmtNumber(data.failed)} 项`);
+    parts.push(`核对 ${fmtNumber(data.checked || 0)} 项`);
+    if (!data.files && !data.deleted) parts.push('没有需要传输的变更');
+  } else if (item.type === 'file') {
+    if (data.kind === 'directory') parts.push(`${fmtNumber(data.files || 0)} 个文件`);
+    parts.push(fmtBytes(data.bytes || 0));
+    parts.push(data.direction === 'incoming' ? '从对方同步' : '本机变更');
+  }
+  return parts.length ? `<div class="activity-stats">${parts.map(part => `<span>${esc(part)}</span>`).join('')}</div>` : '';
+}
+
 function historyTimelineHtml() {
   if (historyState.loading && !historyState.items) return `<div class="empty-state"><div class="empty-glyph">${icon('history')}</div><h3>正在读取动态…</h3></div>`;
   if (historyState.error && !historyState.items) return `<div class="empty-state"><div class="empty-glyph">${icon('alert')}</div><h3>读取失败</h3><p>${esc(historyState.error)}</p><button class="btn" type="button" data-action="refresh-history">重试</button></div>`;
-  const items = (historyState.items || appState.activity || []).filter((item) => historyState.filter === 'all' || item.type === historyState.filter);
+  const items = (historyState.items || appState.activity || []).filter((item) => historyState.filter === 'all' || item.type === historyState.filter || historyState.filter === 'file' && item.type === 'folder');
   if (!items.length) return `<div class="empty-state"><div class="empty-glyph">${icon('history')}</div><h3>还没有符合条件的动态</h3><p>当文件发生变化，或者设备连接、断开时，这里会出现记录。</p></div>`;
   const groups = new Map();
   for (const item of items) {
@@ -1124,8 +1145,8 @@ function historyTimelineHtml() {
   return `<div class="timeline">${[...groups.entries()].map(([label, list]) => `<div class="timeline-group"><div class="timeline-date">${esc(label)}</div>${list.map((item) => {
     const meta = activityMeta(item.level === 'error' ? 'error' : item.type);
     const folder = item.folderId ? folderById(item.folderId) : null;
-    const detail = [item.detail, folder ? folder.name : ''].filter(Boolean).join(' · ');
-    return `<div class="timeline-item"><div class="feed-icon ${meta.className}">${icon(meta.icon)}</div><div class="timeline-copy"><strong>${esc(item.title)}</strong><p>${esc(detail || '—')}</p></div><time>${esc(fmtClock(item.at))}</time></div>`;
+    const detail = [...new Set([item.detail, folder ? folder.name : ''].filter(Boolean))].join(' · ');
+    return `<div class="timeline-item"><div class="feed-icon ${meta.className}">${icon(meta.icon)}</div><div class="timeline-copy"><strong>${esc(item.title)}</strong>${detail ? `<p>${esc(detail)}</p>` : ''}${activityStatsHtml(item)}</div><time>${esc(fmtClock(item.at))}</time></div>`;
   }).join('')}</div>`).join('')}</div>`;
 }
 

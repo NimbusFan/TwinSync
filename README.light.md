@@ -125,7 +125,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-explorer.ps1 -D
 
 ## 文档与贡献
 
-[使用指南](docs/usage.md) · [安全说明](docs/security.md) · [性能记录](docs/performance.md) · [贡献指南](CONTRIBUTING.md) · [GitHub 发布指南](docs/publishing.md)
+[使用指南](docs/usage.md) · [安全说明](docs/security.md) · [贡献指南](CONTRIBUTING.md)
 
 欢迎通过 [Issues](https://github.com/NimbusFan/TwinSync/issues) 反馈问题，通过 Pull Requests 提交改进。安全问题请使用 [私密报告方式](SECURITY.md)。
 

@@ -32,6 +32,7 @@ let browser, socket;
   await send('Page.navigate',{url:`http://127.0.0.1:${port}/#history`});
   await until(`document.querySelector('#history-timeline')?.innerText.includes('可见的同步记录')`);
   assert(await evaluate(`document.querySelector('#history-timeline').innerText.includes('可见的文件记录')`));
+  assert(await evaluate(`document.querySelector('#history-timeline').innerText.includes('同步 3 个文件') && document.querySelector('#history-timeline').innerText.includes('2.5 秒') && document.querySelector('#history-timeline').innerText.includes('8.00 KB')`),'History lost concrete sync statistics.');
   await evaluate(`document.querySelector('[data-action="history-filter"][data-filter="file"]').click()`);
   await until(`document.querySelector('#history-timeline').innerText.includes('可见的文件记录')`);
   assert(!await evaluate(`document.querySelector('#history-timeline').innerText.includes('可见的同步记录')`));

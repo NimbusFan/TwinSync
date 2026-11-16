@@ -7,7 +7,7 @@ using Newtonsoft.Json.Linq;
 
 namespace TwinSync.Native
 {
-    internal sealed class SyncEngine
+    internal sealed partial class SyncEngine
     {
         public ConfigStore Config { get; private set; }
         public Dictionary<string, IndexStore> Indexes { get; private set; }
@@ -114,6 +114,7 @@ namespace TwinSync.Native
             this.fingerprint = fingerprint;
             Status = JsonUtil.Obj("state", "idle", "message", "同步服务已就绪", "currentFile", null, "currentFolder", null, "currentPeer", null, "speed", 0, "total", 0, "done", 0, "lastSyncAt", null, "error", null);
             Journal = new ActivityJournal(config);
+            Scans.Changed = (folder, changes) => QueueFileChanges(folder, null, changes);
             Activity = Journal.Read(50);
             Conflicts = new JArray();
         }
@@ -200,6 +201,8 @@ namespace TwinSync.Native
 
         private void RunPairs(List<SyncPair> pairs, bool manual)
         {
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            runMetrics = JsonUtil.Obj("files", 0, "bytes", 0L, "deleted", 0, "checked", 0, "uploaded", 0, "downloaded", 0, "failed", 0);
             var errors = new JArray(); var successes = 0; var failed = 0; var conflicts = 0; var skipped = 0; var completedFiles = 0;
             var folderFailures = new HashSet<string>();
             var pingResults = new Dictionary<string, string>();
@@ -210,15 +213,16 @@ namespace TwinSync.Native
                 {
                     var peer = pair.Peer; var folder = pair.Folder;
                     var folderId = folder["id"].ToString(); var peerId = peer["id"].ToString();
+                    var pairBefore = (JObject)runMetrics.DeepClone(); var pairTime = System.Diagnostics.Stopwatch.StartNew(); var pairSucceeded = false;
                     try
                     {
                         pair.Check();
                         lock (gate) { Status["currentFolder"] = folderId; Status["currentPeer"] = peerId; IndexFor(folder).Root["syncState"] = "syncing"; }
                         if (!pingResults.ContainsKey(peerId))
                         {
-                            try { new PeerClient(peer, Config.DeviceId, pair.Check).Ping(); pingResults[peerId] = null; lock (gate) online[peerId] = true; }
+                            try { new PeerClient(peer, Config.DeviceId, pair.Check).Ping(); pingResults[peerId] = null; PeerPresence(peer, true); }
                             catch (OperationCanceledException) { throw; }
-                            catch (Exception error) { pingResults[peerId] = error.Message; lock (gate) online[peerId] = false; }
+                            catch (Exception error) { pingResults[peerId] = error.Message; PeerPresence(peer, false); }
                         }
                         if (pingResults[peerId] != null) throw new Exception(pingResults[peerId]);
                         if (scanned.Add(folderId)) { if (manual) ScanFolder(folder, false); else ScanPending(folder); }
@@ -226,7 +230,7 @@ namespace TwinSync.Native
                         pair.Check();
                         completedFiles += result.Completed;
                         if (result.Failures > 0 || result.Conflicts > 0) { folderFailures.Add(folderId); failed += result.Failures > 0 ? 1 : 0; conflicts += result.Conflicts; }
-                        else successes++;
+                        else { successes++; pairSucceeded = true; }
                     }
                     catch (OperationCanceledException) { skipped++; folderFailures.Add(folderId); }
                     catch (Exception error)
@@ -234,7 +238,7 @@ namespace TwinSync.Native
                         failed++; folderFailures.Add(folderId);
                         RecordSyncError(errors, folder, peer, null, error.Message);
                     }
-                    finally { lock (gate) Status["done"] = JsonUtil.GetInt(Status["done"], 0) + 1; }
+                    finally { ReportPeerActivity(peer, folder, pairBefore, pairTime.ElapsedMilliseconds, pairSucceeded); lock (gate) Status["done"] = JsonUtil.GetInt(Status["done"], 0) + 1; }
                 }
                 var outcome = requestedPause ? "paused" : failed > 0 ? (successes > 0 || completedFiles > 0 ? "partial" : "failed") : conflicts > 0 ? "conflict" : skipped > 0 ? "skipped" : "success";
                 var message = outcome == "paused" ? "同步已暂停" : outcome == "success" ? "所选内容同步完成" : outcome == "partial" ? "部分同步失败，请查看失败项目" : outcome == "failed" ? "同步失败，请检查设备连接和文件权限" : outcome == "conflict" ? "存在文件冲突，需要确认" : "同步未全部执行，请检查暂停状态";
@@ -259,7 +263,13 @@ namespace TwinSync.Native
                     Status["error"] = errors.Count > 0 ? errors[0]["message"] : null;
                     if (outcome == "success") Status["lastSyncAt"] = JsonUtil.NowIso();
                     SetStatus(outcome == "failed" ? "error" : outcome == "partial" ? "partial" : outcome == "conflict" ? "conflict" : outcome == "skipped" || outcome == "paused" ? "waiting" : "idle", message, null);
-                    AddActivity("sync", message, errors.Count > 0 ? errors[0]["message"].ToString() : "", outcome == "success" ? "success" : "warn");
+                    FlushActivity(true);
+                    runMetrics["durationMs"] = elapsed.ElapsedMilliseconds;
+                    runMetrics["scope"] = string.Join("；", pairs.Select(pair => (string)pair.Folder["name"] + " ↔ " + DisplayName(pair.Peer, Config)).Distinct().Take(20));
+                    Status["metrics"] = runMetrics.DeepClone();
+                    var activityTitle = outcome != "success" ? message : JsonUtil.GetInt(runMetrics["files"], 0) == 0 && JsonUtil.GetInt(runMetrics["deleted"], 0) == 0 ? "核对完成，没有需要同步的变更" : pairs.Count == 1 ? "已同步「" + pairs[0].Folder["name"] + "」与 " + DisplayName(pairs[0].Peer, Config) : "已完成 " + pairs.Select(pair => (string)pair.Folder["id"]).Distinct().Count() + " 个文件夹的同步";
+                    AddActivity("sync", activityTitle, (string)runMetrics["scope"] + (errors.Count > 0 ? " · " + (string)errors[0]["message"] : ""), outcome == "success" ? "success" : "warn", runMetrics);
+                    runMetrics = null;
                 }
             }
             catch (Exception error)
@@ -268,13 +278,14 @@ namespace TwinSync.Native
             }
             finally
             {
-                lock (gate) { syncing = false; Status["transferActive"] = false; Status["speed"] = 0; Status["finishedAt"] = JsonUtil.NowIso(); Status["currentFolder"] = null; Status["currentPeer"] = null; }
+                lock (gate) { runMetrics = null; FlushActivity(true); syncing = false; Status["transferActive"] = false; Status["speed"] = 0; Status["finishedAt"] = JsonUtil.NowIso(); Status["currentFolder"] = null; Status["currentPeer"] = null; }
                 if (AfterSync != null) try { AfterSync(); } catch (Exception error) { AddActivity("error", "传输缓存维护未完成", error.Message, "warn"); }
             }
         }
 
         private void RecordSyncError(JArray errors, JObject folder, JObject peer, string path, string message)
         {
+            if (runMetrics != null) runMetrics["failed"] = JsonUtil.GetInt(runMetrics["failed"], 0) + 1;
             if (errors.Count < 30) errors.Add(JsonUtil.Obj("folderId", folder["id"], "peerId", peer["id"], "path", path, "message", message));
         }
 
@@ -303,7 +314,7 @@ namespace TwinSync.Native
                     scope = parent;
                 }
                 return Scanner.ScanPaths(folder, IndexFor(folder), Config, new[] { scope }, CheckScan,
-                    path => Scans.Enqueue((string)folder["id"], root, SafePath(root, path))) > 0;
+                    path => Scans.Enqueue((string)folder["id"], root, SafePath(root, path)), changes => QueueFileChanges(folder, null, changes)) > 0;
             }
         }
 
@@ -365,6 +376,7 @@ namespace TwinSync.Native
                                 index.Upsert(local);
                             }
                         }
+                        lock (gate) CountOperation(action, local, remoteEntry);
                         result.Completed++; break;
                     }
                     catch (OperationCanceledException) { throw; }
@@ -492,6 +504,7 @@ namespace TwinSync.Native
                     {
                         Versions.Backup(folder, EntryUtil.PathOf(local), "peer-delete");
                         AtomicFile.DeleteUnchanged(target, EntryUtil.HashOf(local), check);
+                        RecordIncoming(peer, folder, remote, local, true);
                         local["deleted"] = true; local["hash"] = null; local["size"] = 0;
                         local["rev"] = EntryUtil.RevOf(remote); local["origin"] = EntryUtil.OriginOf(remote);
                         index.Upsert(local);
@@ -516,6 +529,7 @@ namespace TwinSync.Native
                     AtomicFile.Commit(temp, target, EntryUtil.HashOf(remote), expected, EntryUtil.MtimeOf(remote), delegate { check(); SafePath(folder["path"].ToString(), EntryUtil.PathOf(remote)); });
                     var entry = (JObject)remote.DeepClone(); entry["baseHash"] = EntryUtil.HashOf(remote); entry["updatedAt"] = JsonUtil.NowIso();
                     index.ObserveRev(EntryUtil.RevOf(entry)); index.Upsert(entry);
+                    RecordIncoming(peer, folder, remote, local, false);
                 }
             }
             finally { try { if (File.Exists(temp)) File.Delete(temp); TransferCache.ForgetDownload(temp); } catch { } }
@@ -580,7 +594,11 @@ namespace TwinSync.Native
                 lock (gate)
                 {
                     var check = transferCheck ?? TransferGuard(peer, folder, true); check();
-                    return AcceptIncomingFileCore(peer, folder, relPath, incoming, temp, check);
+                    var previous = IndexFor(folder).Get(relPath);
+                    previous = previous == null ? null : (JObject)previous.DeepClone();
+                    var result = AcceptIncomingFileCore(peer, folder, relPath, incoming, temp, check);
+                    if (!JsonUtil.GetBool(result["conflict"], false) && !JsonUtil.GetBool(result["superseded"], false) && !EntryUtil.SameContent(previous, incoming)) RecordIncoming(peer, folder, incoming, previous, false);
+                    return result;
                 }
             }
             finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
@@ -649,7 +667,10 @@ namespace TwinSync.Native
             lock (gate)
             {
                 TransferGuard(peer, folder, true)();
-                return AcceptIncomingDeleteCore(peer, folder, relPath, incoming);
+                var previous = IndexFor(folder).Get(relPath); previous = previous == null ? null : (JObject)previous.DeepClone();
+                var result = AcceptIncomingDeleteCore(peer, folder, relPath, incoming);
+                if (previous != null && !EntryUtil.Deleted(previous) && !JsonUtil.GetBool(result["conflict"], false)) RecordIncoming(peer, folder, incoming, previous, true);
+                return result;
             }
         }
 
@@ -703,12 +724,12 @@ namespace TwinSync.Native
             try
             {
                 new PeerClient(peer, Config.DeviceId).Ping();
-                lock (gate) online[JsonUtil.GetString(peer["id"], "")] = true;
+                PeerPresence(peer, true);
                 return true;
             }
             catch
             {
-                lock (gate) online[JsonUtil.GetString(peer["id"], "")] = false;
+                PeerPresence(peer, false);
                 return false;
             }
         }
@@ -750,7 +771,7 @@ namespace TwinSync.Native
             Config.GetPeer(JsonUtil.GetString(peer["id"], ""))["fingerprint"] = remoteFingerprint;
             Config.Save();
             MergeFolders(response["folders"] as JArray, JsonUtil.GetString(peer["id"], ""));
-            AddActivity("device", "已连接设备", JsonUtil.GetString(peer["name"], ""), "success");
+            AddActivity("device", DisplayName(peer, Config) + " 已配对", "等待选择共享文件夹", "success", JsonUtil.Obj("actor", DisplayName(peer, Config), "action", "paired"));
             SyncAll(true);
             return peer;
         }
@@ -769,7 +790,7 @@ namespace TwinSync.Native
             AddPeer(peerId, JsonUtil.GetString(device["name"], "设备"), ip, JsonUtil.GetInt(device["port"], 55220), token, JsonUtil.GetString(device["hostname"], ""));
             Config.GetPeer(peerId)["fingerprint"] = remoteFingerprint;
             MergeFolders(body["folders"] as JArray, peerId);
-            AddActivity("device", "设备已连接", ip, "success");
+            AddActivity("device", DisplayName(Config.GetPeer(peerId), Config) + " 已配对", "等待选择共享文件夹", "success", JsonUtil.Obj("actor", DisplayName(Config.GetPeer(peerId), Config), "action", "paired"));
             var response = JsonUtil.Obj("ok", true, "token", token, "device", JsonUtil.Obj("id", Config.DeviceId, "name", Config.DeviceName, "platform", "win32", "port", Config.Port, "fingerprint", fingerprint), "folders", new JArray());
             Config.Save();
             return response;
@@ -866,11 +887,11 @@ namespace TwinSync.Native
             }
         }
 
-        public void AddActivity(string type, string title, string detail, string level)
+        public void AddActivity(string type, string title, string detail, string level, JObject data = null)
         {
             lock (gate)
             {
-                Activity.Insert(0, Journal.Append(type, title, detail, level));
+                Activity.Insert(0, Journal.Append(type, title, detail, level, data));
                 while (Activity.Count > 50) Activity.RemoveAt(Activity.Count - 1);
             }
         }
